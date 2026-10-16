@@ -1,0 +1,21 @@
+# Python environments and caches
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.cache.sqlite
+
+# Local data, exports, and databases
+*.sqlite
+*.sqlite3
+*.db
+*.xlsx
+amber_*.json
+
+# Credentials and local configuration
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Logs
+*.log
