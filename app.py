@@ -657,60 +657,63 @@ st.title("☀️ Solcast Solar Forecast Dashboard")
 st.caption("Rooftop PV forecast · Daily energy estimates in Australia/Sydney time")
 
 with st.sidebar:
-    st.header("Connection")
-    api_key = st.text_input(
-        "Solcast API key",
-        value=os.getenv("SOLCAST_API_KEY", ""),
-        type="password",
-        help="Used for the request only. The dashboard does not save the key to its database.",
-    )
-    st.caption(f"Site ID: `{SITE_ID_DEFAULT}`")
+    st.header("Controls")
+    st.caption(f"Local database · {DB_PATH.name}")
+    api_key = os.getenv("SOLCAST_API_KEY", "").strip()
     key_fingerprint = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest() if api_key.strip() else ""
-    check_clicked = st.button("1. Check API authorization", width="stretch", disabled=not bool(api_key.strip()))
     authorized = bool(key_fingerprint) and st.session_state.get("authorized_key_fingerprint") == key_fingerprint
-    if authorized:
-        st.success("Authorization checkpoint passed for the current API key.")
-    else:
-        st.info("Check authorization before downloading a forecast.")
-    fetch_clicked = st.button("2. Download latest forecast", type="primary", width="stretch", disabled=not authorized)
-    st.caption("The authorization check makes a separate estimated-actuals API request and may count toward your Solcast quota. Avoid repeated checks, especially after a 429.")
-    st.divider()
-    st.header("Data")
-    st.write(f"Database: `{DB_PATH.name}`")
-    st.caption("The dashboard stores every download locally. For automatic daily downloads when the app is closed, see README.md.")
-    openmeteo_refresh_clicked = st.button("Refresh Open-Meteo data and forecast", width="stretch")
-    st.caption("Updates archive irradiance from 8 October through its latest available date and the 7-day weather forecast in SQLite.")
-    st.divider()
-    st.header("Sigen Open Platform")
-    st.caption(f"Station ID: `{SIGEN_STATION_ID}`")
-    sigen_start_date = st.date_input(
-        "Actuals start date", value=pd.Timestamp("2026-10-01").date(), key="sigen_start_date",
-    )
-    sigen_end_date = st.date_input(
-        "Actuals end date (Sydney)", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_end_date",
-    )
-    sigen_update_clicked = st.button(
-        "Update Power Actuals from Sigen",
-        disabled=sigen_end_date < sigen_start_date,
-        help="Uses the installed Sigen Open Platform client. Its browser authorization stays with the client; no Sigen token is stored by this app.",
-    )
-    st.caption("Reads five-minute solar power through the selected end date and stores power, derived energy, and raw Sigen rows in SQLite.")
-    st.divider()
-    st.header("Amber prices")
-    amber_api_key = st.text_input(
-        "Amber API key",
-        value=os.getenv("AMBER_API_KEY", ""),
-        type="password",
-        help="Read from AMBER_API_KEY. The key is only sent to Amber and is not stored in the database.",
-    )
-    amber_date = st.date_input("Price date (Sydney)", value=pd.Timestamp.now(tz=TZ_NAME).date())
-    amber_fetch_clicked = st.button("Fetch Amber prices and 2-day forecast", disabled=not bool(amber_api_key.strip()))
-    amber_48_clicked = st.button("Fetch next 48 five-minute periods", disabled=not bool(amber_api_key.strip()))
-    amber_update_actuals_clicked = st.button(
-        "Update Amber prices since last CurrentInterval",
-        disabled=not bool(amber_api_key.strip()),
-        help="Fetches actual Amber intervals from the most recently saved CurrentInterval through now.",
-    )
+    with st.expander("Solcast", expanded=True):
+        st.caption(f"API key {'ready' if api_key else 'missing'} · Site {SITE_ID_DEFAULT}")
+        check_clicked = st.button(
+            "Check authorization", width="stretch", disabled=not bool(api_key),
+            help="Makes a separate estimated-actuals request and may use API quota.",
+        )
+        if authorized:
+            st.caption("Authorization passed")
+        else:
+            st.caption("Authorize before downloading a forecast.")
+        fetch_clicked = st.button(
+            "Download latest forecast", type="primary", width="stretch", disabled=not authorized,
+        )
+
+    with st.expander("Open-Meteo"):
+        openmeteo_refresh_clicked = st.button(
+            "Refresh archive and forecast", width="stretch",
+            help="Refreshes archive data from 8 October through the latest available date and fetches a 7-day forecast.",
+        )
+
+    with st.expander("Sigen actuals"):
+        st.caption(f"Station {SIGEN_STATION_ID}")
+        sigen_start_date = st.date_input(
+            "Start date", value=pd.Timestamp("2026-10-01").date(), key="sigen_start_date",
+        )
+        sigen_end_date = st.date_input(
+            "End date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_end_date",
+        )
+        sigen_update_clicked = st.button(
+            "Update power actuals", width="stretch",
+            disabled=sigen_end_date < sigen_start_date,
+            help="Reads five-minute Sigen power through the selected end date. Authorization is handled by the installed Sigen client.",
+        )
+
+    with st.expander("Amber prices"):
+        amber_api_key = os.getenv("AMBER_API_KEY", "").strip()
+        st.caption(f"API key {'ready' if amber_api_key else 'missing'}")
+        amber_date = st.date_input(
+            "Price date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="amber_fetch_date",
+        )
+        amber_fetch_clicked = st.button(
+            "Fetch date and forecast", width="stretch", disabled=not bool(amber_api_key),
+            help="Fetches the selected date and requests up to 48 hours of current-price forecasts.",
+        )
+        amber_48_clicked = st.button(
+            "Fetch next 48 intervals", width="stretch", disabled=not bool(amber_api_key),
+        )
+        amber_update_actuals_clicked = st.button(
+            "Update actual prices through now", width="stretch",
+            disabled=not bool(amber_api_key),
+            help="Fetches actual intervals from the latest saved CurrentInterval through now.",
+        )
 
 if openmeteo_refresh_clicked:
     try:
@@ -803,7 +806,7 @@ if st.session_state.get("sigen_update_message"):
 if check_clicked:
     st.session_state.pop("authorized_key_fingerprint", None)
     if not api_key.strip():
-        st.error("Enter your Solcast API key first.")
+        st.error("Set the SOLCAST_API_KEY environment variable first, then restart the app.")
     else:
         try:
             with st.spinner("Checking authorization for this rooftop site…"):
@@ -819,7 +822,7 @@ if check_clicked:
 if fetch_clicked:
     # Re-check the authorization checkpoint in code, not just in the button state.
     if not api_key.strip() or st.session_state.get("authorized_key_fingerprint") != key_fingerprint:
-        st.error("Authorization checkpoint has not passed for this API key. Check authorization first.")
+        st.error("Authorization checkpoint has not passed for SOLCAST_API_KEY. Check authorization first.")
     else:
         try:
             with st.spinner("Downloading forecast from Solcast…"):
@@ -1017,7 +1020,7 @@ else:
 
 history = load_history()
 if history.empty:
-    st.info("No forecast data saved yet. Enter your API key in the sidebar and choose **Download latest forecast**.")
+    st.info("No forecast data saved yet. Configure SOLCAST_API_KEY and choose **Download latest forecast**.")
     st.markdown("""
     **What this dashboard will show**
     - Daily forecast energy (kWh)

@@ -3,7 +3,8 @@
 A local Streamlit app for your Solcast rooftop-site forecast endpoint.
 
 ## Features
-- Enter the API key in the app, run a separate authorization checkpoint using the rooftop-site estimated-actuals endpoint, then download the current forecast only if authorization succeeds.
+- Load `SOLCAST_API_KEY` and `AMBER_API_KEY` from the process environment; no API key is entered in the app sidebar.
+- Run a separate Solcast authorization checkpoint using the rooftop-site estimated-actuals endpoint, then download the current forecast only if authorization succeeds.
 - Daily forecast generation estimates (kWh), peak power (kW), and half-hourly curves.
 - Meter actuals from the Sigen energy and power Excel exports in the project folder, alongside Solcast estimated actuals.
 - On-demand Sigen refresh of the power actuals workbook through the latest available five-minute reading.
@@ -28,9 +29,9 @@ Site ID is preconfigured as `1c66-66cb-9735-8787`.
    streamlit run app.py
    ```
 
-4. The dashboard opens in your browser. Enter your Solcast API key in the sidebar and click **Download latest forecast**.
+4. Set `SOLCAST_API_KEY` and `AMBER_API_KEY` as Windows user environment variables, then restart the terminal and launch the dashboard. The keys are loaded automatically; click **Check API authorization** before downloading a Solcast forecast.
 
-The key entered into the app is not saved to the SQLite database. It is sent to Solcast in the HTTPS `Authorization: Bearer` header. Do not share your API key.
+The keys are read from the process environment and sent to Solcast or Amber in HTTPS `Authorization: Bearer` headers. They are not stored in the SQLite database or shown in the dashboard. Do not commit or share API keys.
 
 Set the `AMBER_API_KEY` environment variable to enable Amber downloads in the dashboard. Select a Sydney date and choose **Fetch Amber prices and 2-day forecast** to fetch that date from `/prices` plus the next 576 intervals from `/prices/current`, or choose **Fetch next 48 five-minute periods** to request `next=48&resolution=5`. Current forecast downloads are retained as snapshots; for each interval, the chart selects the newest non-null value and falls back to older snapshots when needed. Actual intervals take precedence where available. The graph can show all channels or filter to `general`, `controlledLoad`, or `feedIn`. The key is sent only in HTTPS authorization headers and is not stored in SQLite. You can also run `python download_amber.py YYYY-MM-DD` to fetch a date from a terminal.
 
@@ -60,7 +61,7 @@ Important:
 - The authorization checkpoint is a separate estimated-actuals API request before the forecast request. It can count toward API usage; use it sparingly and avoid repeated tests when a 429 rate limit has occurred.
 - Use the same folder/database path for the app and scheduled task.
 - Task Scheduler must run under the same Windows account that has the `SOLCAST_API_KEY` variable.
-- If you don't want to store a key in an environment variable, use the in-app manual download instead.
+- The dashboard and scheduled download script use `SOLCAST_API_KEY` from the environment. Amber downloads use `AMBER_API_KEY` from the environment.
 - Solcast hobbyist accounts may have a daily API request quota. This app only requests data when you click the button; the scheduled script makes one request per run. Avoid scheduling both multiple times per day.
 - The forecast is future generation, not measured actual production. Energy is estimated by multiplying forecast power (kW) by each interval's duration (hours), then summing by Sydney local date.
 - If your Solcast account returns a different response schema, check the error message and the official API docs: https://docs.solcast.com.au/docs/section/rooftop-sites-hobbyist
