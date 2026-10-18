@@ -15,7 +15,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
 SITE_ID_DEFAULT = "1c66-66cb-9735-8787"
 SITE_URL = f"https://api.solcast.com.au/rooftop_sites/{SITE_ID_DEFAULT}"
@@ -32,7 +33,7 @@ SIGEN_MCP_SCRIPT = Path(os.getenv(
 ))
 
 def first_existing_file(*names):
-    candidates = [APP_DIR / name for name in names]
+    candidates = [APP_DIR / name for name in names] + [RESOURCE_DIR / name for name in names]
     return next((path for path in candidates if path.exists()), candidates[0])
 
 ENERGY_ACTUALS_FILE = first_existing_file(
@@ -718,8 +719,10 @@ with st.sidebar:
 if openmeteo_refresh_clicked:
     try:
         with st.spinner("Refreshing Open-Meteo archive and 7-day forecast…"):
+            command = ([sys.executable, "--openmeteo"] if getattr(sys, "frozen", False)
+                       else [sys.executable, str(APP_DIR / "openmeteo.py")])
             result = subprocess.run(
-                [sys.executable, str(APP_DIR / "openmeteo.py")],
+                command,
                 cwd=APP_DIR, capture_output=True, text=True, timeout=180,
             )
         if result.returncode:

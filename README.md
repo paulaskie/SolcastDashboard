@@ -31,6 +31,37 @@ Site ID is preconfigured as `1c66-66cb-9735-8787`.
 
 4. Set `SOLCAST_API_KEY` and `AMBER_API_KEY` as Windows user environment variables, then restart the terminal and launch the dashboard. The keys are loaded automatically; click **Check API authorization** before downloading a Solcast forecast.
 
+## Build and run the Windows executable
+
+The executable is a single-file Windows x64 package. Build it on Windows (PyInstaller does not cross-compile Windows executables from other operating systems):
+
+```bat
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt pyinstaller
+python -m PyInstaller --clean solcast_dashboard.spec
+```
+
+Give the other machine the resulting `dist\SolcastDashboard.exe`. On that machine:
+
+1. Copy the EXE to a folder the user can write to, such as `%LOCALAPPDATA%\SolcastDashboard`. The app creates `solcast_history.sqlite3` and its Open-Meteo cache in that folder, so keep the EXE in the same place between runs and back up the database if its history matters.
+2. Set API keys in that Windows user's environment (only needed for the corresponding downloads), then sign out and back in or open a fresh terminal so Windows apps inherit them:
+
+   ```bat
+   setx SOLCAST_API_KEY "your-solcast-key"
+   setx AMBER_API_KEY "your-amber-key"
+   ```
+
+3. Double-click `SolcastDashboard.exe`. It starts the local Streamlit server and opens the dashboard in the default browser. It listens on localhost.
+
+Python and Python PATH entries are not needed on the destination machine. Network access is needed for Solcast, Amber, and Open-Meteo features. The bundled workbook samples are used on first run; place updated `Sigen_Energy_Actuals.xlsx` or `Sigen_Power_Actuals.xlsx` beside the EXE to import those instead. The Sigen Open Platform refresh additionally requires Node.js on PATH and the Sigen `sigen.mjs` client. Set `SIGEN_MCP_SCRIPT` to that script's full path if it is not in the default Codex skills location. The Open-Meteo refresh button works from the executable without a separate Python installation.
+
+To choose another writable database location, set `SOLCAST_DB_PATH` to its full SQLite filename before starting the EXE. If the dashboard does not open, run it from Command Prompt to see the startup error:
+
+```bat
+SolcastDashboard.exe
+```
+
 The keys are read from the process environment and sent to Solcast or Amber in HTTPS `Authorization: Bearer` headers. They are not stored in the SQLite database or shown in the dashboard. Do not commit or share API keys.
 
 Set the `AMBER_API_KEY` environment variable to enable Amber downloads in the dashboard. Select a Sydney date and choose **Fetch Amber prices and 2-day forecast** to fetch that date from `/prices` plus the next 576 intervals from `/prices/current`, or choose **Fetch next 48 five-minute periods** to request `next=48&resolution=5`. Current forecast downloads are retained as snapshots; for each interval, the chart selects the newest non-null value and falls back to older snapshots when needed. Actual intervals take precedence where available. The graph can show all channels or filter to `general`, `controlledLoad`, or `feedIn`. The key is sent only in HTTPS authorization headers and is not stored in SQLite. You can also run `python download_amber.py YYYY-MM-DD` to fetch a date from a terminal.
