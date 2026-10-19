@@ -4,6 +4,8 @@
 __pycache__/
 *.py[cod]
 .cache.sqlite
+build/
+dist/
 
 # Local data, exports, and databases
 *.sqlite
