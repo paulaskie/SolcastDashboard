@@ -1293,7 +1293,7 @@ st.caption(
     "Open-Meteo estimates use 22° tilted irradiance weighted for your array: "
     "80% north-facing and 20% east-facing, scaled to 9.5 kW with an assumed "
     "0.80 performance ratio. Actual power comes from the Sigen meter. "
-    "The archive estimate is interpolated to Sigen timestamps; the forecast keeps all hourly points for the selected day."
+    "The archive estimate is interpolated to Sigen timestamps; the forecast keeps all 15-minute points for the selected day."
 )
 openmeteo_dates = sorted(openmeteo_hourly["local_date"].unique()) if not openmeteo_hourly.empty else []
 openmeteo_forecast_dates = (
