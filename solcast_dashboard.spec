@@ -6,8 +6,6 @@ root = Path(SPECPATH)
 datas = [
     (str(root / "app.py"), "."),
     (str(root / "openmeteo.py"), "."),
-    (str(root / "Sigen_Energy_Actuals.xlsx"), "."),
-    (str(root / "Sigen_Power_Actuals.xlsx"), "."),
 ]
 binaries = []
 hiddenimports = ["streamlit", "streamlit.web.cli", "openmeteo_requests", "requests_cache", "retry_requests"]
