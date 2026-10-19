@@ -31,9 +31,9 @@ from solcast_data import (
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
 PV_SYSTEM_CAPACITY_KW = 9.5
-OPENMETEO_PERFORMANCE_RATIO = 0.80
+OPENMETEO_DEFAULT_PERFORMANCE_RATIO = 0.80
 
-st.set_page_config(page_title="Solcast Solar Forecast", page_icon="☀️", layout="wide")
+st.set_page_config(page_title="Solar Forecast", page_icon="☀️", layout="wide")
 
 def connect_db():
     conn = sqlite3.connect(DB_PATH)
@@ -378,9 +378,55 @@ def prepare_openmeteo_estimates(weather):
     # Plane-weighted GTI is W/m²; scale by array capacity and assumed system PR.
     weather["openmeteo_power_kw"] = (
         weather["weighted_panel_irradiance"] / 1000
-        * PV_SYSTEM_CAPACITY_KW * OPENMETEO_PERFORMANCE_RATIO
+        * PV_SYSTEM_CAPACITY_KW * OPENMETEO_DEFAULT_PERFORMANCE_RATIO
     )
     return weather.dropna(subset=["time_local", "openmeteo_power_kw"])
+
+def calibrate_openmeteo_performance_ratio(archive_weather, meter_power):
+    """Fit a fixed PV performance ratio from matching archive and meter samples."""
+    if archive_weather.empty or meter_power.empty:
+        return OPENMETEO_DEFAULT_PERFORMANCE_RATIO, 0, 0
+
+    weather_irradiance = archive_weather.set_index("time_local")[
+        ["weighted_panel_irradiance"]
+    ].sort_index()
+    meter_times = pd.DatetimeIndex(meter_power["period_end_local"])
+    combined_times = weather_irradiance.index.union(meter_times).sort_values()
+    aligned_irradiance = (
+        weather_irradiance.reindex(combined_times)
+        .interpolate(method="time", limit_area="inside")
+        .reindex(meter_times)["weighted_panel_irradiance"]
+    )
+    base_power_kw = pd.to_numeric(aligned_irradiance, errors="coerce") * (
+        PV_SYSTEM_CAPACITY_KW / 1000
+    )
+    actual_power_kw = pd.to_numeric(meter_power["Solar Production (kW)"], errors="coerce")
+    calibration = pd.DataFrame({
+        "time_local": meter_times,
+        "base_power_kw": base_power_kw.to_numpy(),
+        "actual_power_kw": actual_power_kw.to_numpy(),
+    }).dropna()
+    # Exclude night and very low-light samples, where inverter startup and meter
+    # resolution can dominate the ratio.
+    calibration = calibration[calibration["base_power_kw"] >= 0.2]
+    day_count = calibration["time_local"].dt.date.nunique()
+    if len(calibration) < 500 or day_count < 3:
+        return OPENMETEO_DEFAULT_PERFORMANCE_RATIO, len(calibration), day_count
+
+    base = calibration["base_power_kw"].to_numpy()
+    actual = calibration["actual_power_kw"].to_numpy()
+    fitted_ratio = float(np.dot(base, actual) / np.dot(base, base))
+    # Guard against invalid telemetry or an incorrect system-capacity setting.
+    fitted_ratio = float(np.clip(fitted_ratio, 0.30, 1.00))
+    return fitted_ratio, len(calibration), day_count
+
+def apply_openmeteo_performance_ratio(weather, performance_ratio):
+    if not weather.empty:
+        weather["openmeteo_power_kw"] = (
+            weather["weighted_panel_irradiance"] / 1000
+            * PV_SYSTEM_CAPACITY_KW * performance_ratio
+        )
+    return weather
 
 def daily_summary(df):
     out = df.groupby("local_date", as_index=False).agg(
@@ -461,7 +507,7 @@ def load_meter_actuals():
         power["Solar Production (kW)"] = power["power_kw"]
     return energy, power
 
-st.title("☀️ Solcast Solar Forecast Dashboard")
+st.title("☀️ Solar Forecast Dashboard")
 st.caption("Rooftop PV forecast · Daily energy estimates in Australia/Sydney time")
 
 with st.sidebar:
@@ -835,6 +881,15 @@ latest = latest.sort_values("period_end_local")
 actuals = load_latest_actuals()
 openmeteo_hourly = load_openmeteo_hourly()
 openmeteo_forecast_hourly = load_openmeteo_forecast_hourly()
+openmeteo_performance_ratio, performance_ratio_samples, performance_ratio_days = (
+    calibrate_openmeteo_performance_ratio(openmeteo_hourly, power_actuals)
+)
+openmeteo_hourly = apply_openmeteo_performance_ratio(
+    openmeteo_hourly, openmeteo_performance_ratio,
+)
+openmeteo_forecast_hourly = apply_openmeteo_performance_ratio(
+    openmeteo_forecast_hourly, openmeteo_performance_ratio,
+)
 openmeteo_daily = load_openmeteo_daily()
 daily = daily_summary(latest)
 if not actuals.empty:
@@ -1133,10 +1188,20 @@ fig2.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
 st.plotly_chart(fig2, width="stretch")
 
 st.subheader("Open-Meteo estimated and actual power by time")
+if performance_ratio_samples >= 500 and performance_ratio_days >= 3:
+    performance_ratio_caption = (
+        f"a calibrated {openmeteo_performance_ratio:.3f} ratio from "
+        f"{performance_ratio_samples:,} daylight samples over {performance_ratio_days} days"
+    )
+else:
+    performance_ratio_caption = (
+        f"the default {OPENMETEO_DEFAULT_PERFORMANCE_RATIO:.2f} ratio "
+        "(not enough overlapping history to calibrate)"
+    )
 st.caption(
     "Open-Meteo estimates use 22° tilted irradiance weighted for your array: "
-    "80% north-facing and 20% east-facing, scaled to 9.5 kW with an assumed "
-    "0.80 performance ratio. Actual power comes from the Sigen meter. "
+    "80% north-facing and 20% east-facing, scaled to 9.5 kW with "
+    f"{performance_ratio_caption}. Actual power comes from the Sigen meter. "
     "The archive estimate is interpolated to Sigen timestamps; the forecast keeps all 15-minute points for the selected day."
 )
 openmeteo_dates = sorted(openmeteo_hourly["local_date"].unique()) if not openmeteo_hourly.empty else []
