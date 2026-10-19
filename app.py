@@ -16,7 +16,6 @@ import requests
 import streamlit as st
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
 SITE_ID_DEFAULT = "1c66-66cb-9735-8787"
 SITE_URL = f"https://api.solcast.com.au/rooftop_sites/{SITE_ID_DEFAULT}"
@@ -32,19 +31,6 @@ SIGEN_MCP_SCRIPT = Path(os.getenv(
     str(Path.home() / ".codex" / "skills" / "sigen-open-platform" / "scripts" / "sigen.mjs"),
 ))
 
-def first_existing_file(*names):
-    candidates = [APP_DIR / name for name in names] + [RESOURCE_DIR / name for name in names]
-    return next((path for path in candidates if path.exists()), candidates[0])
-
-ENERGY_ACTUALS_FILE = first_existing_file(
-    "Sigen_Energy_Actuals.xlsx",
-    "20261001_1600_20261014_1000_Sigen_Energy_Actuals.xlsx",
-    "20261001_1600_20261014_1000_Energy_Actuals.xlsx",
-)
-POWER_ACTUALS_FILE = first_existing_file(
-    "Sigen_Power_Actuals.xlsx",
-    "20261001_1605_20261014_1050_Power_Actuals.xlsx",
-)
 AMBER_SITE_ID = "01M4M4A4ZJW5FK6KCP6JKMC10H"
 AMBER_PRICES_URL = f"https://api.amber.com.au/v1/sites/{AMBER_SITE_ID}/prices"
 AMBER_CURRENT_PRICES_URL = f"{AMBER_PRICES_URL}/current"
@@ -506,29 +492,10 @@ def daily_summary(df):
     )
     return out.sort_values("local_date")
 
-def load_excel_actuals(path, value_column):
-    """Load a local inverter export and interpret its naive timestamps as Sydney local time."""
-    if not path.exists():
-        return pd.DataFrame()
-    available_columns = pd.read_excel(path, nrows=0).columns.tolist()
-    usecols = ["Date", value_column]
-    if "Raw Sigen JSON" in available_columns:
-        usecols.append("Raw Sigen JSON")
-    df = pd.read_excel(path, usecols=usecols)
-    timestamps = pd.to_datetime(df["Date"], errors="coerce")
-    if timestamps.dt.tz is None:
-        timestamps = timestamps.dt.tz_localize(TZ_NAME, ambiguous="NaT", nonexistent="NaT")
-    else:
-        timestamps = timestamps.dt.tz_convert(TZ_NAME)
-    df["period_end_local"] = timestamps
-    df["local_date"] = timestamps.dt.date.astype(str)
-    df[value_column] = pd.to_numeric(df[value_column], errors="coerce")
-    return df.dropna(subset=["period_end_local", value_column]).sort_values("period_end_local")
-
 def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
     imported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    energy_source = source_file or ENERGY_ACTUALS_FILE.name
-    power_source = source_file or POWER_ACTUALS_FILE.name
+    energy_source = source_file or "Sigen Open Platform"
+    power_source = source_file or "Sigen Open Platform"
     conn = connect_db()
     with conn:
         for _, row in energy_actuals.iterrows():
@@ -853,21 +820,6 @@ if st.session_state.get("last_download_message"):
     st.success(st.session_state["last_download_message"])
 if st.session_state.get("actuals_download_error"):
     st.warning(f"Estimated actuals could not be refreshed; showing the most recently saved actuals, if available. {st.session_state['actuals_download_error']}")
-
-try:
-    energy_workbook = load_excel_actuals(ENERGY_ACTUALS_FILE, "Total Solar Production Energy (kWh)")
-    power_workbook = load_excel_actuals(POWER_ACTUALS_FILE, "Solar Production (kW)")
-    if (not energy_workbook.empty and not power_workbook.empty
-            and "Raw Sigen JSON" in energy_workbook.columns):
-        sigen_raw_by_time = dict(zip(
-            energy_workbook["period_end_local"], energy_workbook["Raw Sigen JSON"],
-        ))
-        power_workbook["Raw Sigen JSON"] = power_workbook["period_end_local"].map(sigen_raw_by_time)
-    save_meter_actuals(energy_workbook, power_workbook)
-except ImportError:
-    st.error("Reading the Excel actuals requires openpyxl. Install project dependencies from requirements.txt.")
-except Exception as e:
-    st.warning(f"Could not import the Excel actuals workbooks: {e}")
 
 energy_actuals, power_actuals = load_meter_actuals()
 amber_prices = load_amber_prices()
