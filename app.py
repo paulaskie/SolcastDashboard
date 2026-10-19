@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -14,26 +14,24 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from amber_data import fetch_current_prices as fetch_amber_current_prices
+from amber_data import fetch_actuals_between as fetch_amber_actuals_between
+from amber_data import fetch_prices as fetch_amber_prices
+from sigen_data import STATION_ID as SIGEN_STATION_ID
+from sigen_data import fetch_actuals as fetch_sigen_actuals
+from solcast_data import (
+    SITE_ID as SITE_ID_DEFAULT,
+    TZ_NAME,
+    check_authorization,
+    fetch_estimated_actuals,
+    fetch_forecast,
+    parse_period_hours,
+)
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
-SITE_ID_DEFAULT = "1c66-66cb-9735-8787"
-SITE_URL = f"https://api.solcast.com.au/rooftop_sites/{SITE_ID_DEFAULT}"
-AUTH_CHECK_URL = f"{SITE_URL}/estimated_actuals?format=json"
-ACTUALS_URL = AUTH_CHECK_URL
-API_URL = f"{SITE_URL}/forecasts?format=json"
-TZ_NAME = "Australia/Sydney"
-SIGEN_STATION_ID = 2_610_011_552_188_752
 PV_SYSTEM_CAPACITY_KW = 9.5
 OPENMETEO_PERFORMANCE_RATIO = 0.80
-SIGEN_MCP_SCRIPT = Path(os.getenv(
-    "SIGEN_MCP_SCRIPT",
-    str(Path.home() / ".codex" / "skills" / "sigen-open-platform" / "scripts" / "sigen.mjs"),
-))
-
-AMBER_SITE_ID = "01M4M4A4ZJW5FK6KCP6JKMC10H"
-AMBER_PRICES_URL = f"https://api.amber.com.au/v1/sites/{AMBER_SITE_ID}/prices"
-AMBER_CURRENT_PRICES_URL = f"{AMBER_PRICES_URL}/current"
 
 st.set_page_config(page_title="Solcast Solar Forecast", page_icon="☀️", layout="wide")
 
@@ -122,35 +120,34 @@ def connect_db():
             conn.execute(f"ALTER TABLE {table} ADD COLUMN raw_json TEXT NOT NULL DEFAULT '{{}}'")
     return conn
 
-def fetch_amber_prices(api_key, price_date):
-    response = requests.get(
-        AMBER_PRICES_URL,
-        headers={"Authorization": f"Bearer {api_key.strip()}", "Accept": "application/json"},
-        params={"startDate": price_date, "endDate": price_date, "resolution": 5},
-        timeout=30,
-    )
-    if response.status_code in (401, 403):
-        raise ValueError(f"Amber rejected the API key ({response.status_code}). Check AMBER_API_KEY and site access.")
-    response.raise_for_status()
-    rows = response.json()
-    if not isinstance(rows, list):
-        raise ValueError("Amber response was not a list of price intervals.")
-    return rows
-
-def fetch_amber_current_prices(api_key, next_intervals=576):
-    response = requests.get(
-        AMBER_CURRENT_PRICES_URL,
-        headers={"Authorization": f"Bearer {api_key.strip()}", "Accept": "application/json"},
-        params={"next": next_intervals, "resolution": 5},
-        timeout=45,
-    )
-    if response.status_code in (401, 403):
-        raise ValueError(f"Amber rejected the API key ({response.status_code}). Check AMBER_API_KEY and site access.")
-    response.raise_for_status()
-    rows = response.json()
-    if not isinstance(rows, list):
-        raise ValueError("Amber current-prices response was not a list of intervals.")
-    return rows
+def date_picker_with_next(label, value, key, min_value=None, max_value=None):
+    """Render a calendar picker with a one-day forward button."""
+    current_value = st.session_state.get(key, value)
+    if isinstance(current_value, str):
+        current_value = pd.Timestamp(current_value).date()
+    if min_value is not None and current_value < min_value:
+        current_value = min_value
+    if max_value is not None and current_value > max_value:
+        current_value = max_value
+    if key not in st.session_state or st.session_state[key] != current_value:
+        st.session_state[key] = current_value
+    picker_col, next_col = st.columns([5, 1], vertical_alignment="bottom")
+    with next_col:
+        next_clicked = st.button(
+            "Next date", key=f"{key}_next",
+            disabled=max_value is not None and current_value >= max_value,
+            width="stretch",
+        )
+    if next_clicked:
+        current_value += timedelta(days=1)
+        if max_value is not None:
+            current_value = min(current_value, max_value)
+        st.session_state[key] = current_value
+    with picker_col:
+        selected_value = st.date_input(
+            label, value=None, min_value=min_value, max_value=max_value, key=key,
+        )
+    return selected_value
 
 def save_amber_prices(rows):
     fetched_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
@@ -194,21 +191,7 @@ def refresh_amber_actuals_since_last_current(api_key):
     now_utc = pd.Timestamp.now(tz="UTC")
     if start_utc >= now_utc:
         return 0
-
-    # Amber's historical prices endpoint accepts local calendar dates, so fetch
-    # every date touched by the missing interval and keep only actuals in the gap.
-    start_local_date = start_utc.tz_convert(TZ_NAME).date()
-    end_local_date = now_utc.tz_convert(TZ_NAME).date()
-    rows_to_save = []
-    for day in pd.date_range(start_local_date, end_local_date, freq="D"):
-        day_rows = fetch_amber_prices(api_key, day.date().isoformat())
-        for price_row in day_rows:
-            if str(price_row.get("type") or "").lower() not in {"actualinterval", "currentinterval"}:
-                continue
-            interval_end = pd.to_datetime(price_row.get("endTime"), utc=True, errors="coerce")
-            if pd.isna(interval_end) or not (start_utc < interval_end <= now_utc):
-                continue
-            rows_to_save.append(price_row)
+    rows_to_save = fetch_amber_actuals_between(api_key, start_utc, now_utc)
     if rows_to_save:
         save_amber_prices(rows_to_save)
     return len(rows_to_save)
@@ -227,111 +210,6 @@ def load_amber_prices():
         prices["start_time_local"] = pd.to_datetime(prices["start_time_utc"], utc=True).dt.tz_convert(TZ_NAME)
         prices["end_time_local"] = pd.to_datetime(prices["end_time_utc"], utc=True).dt.tz_convert(TZ_NAME)
     return prices
-
-def parse_period_hours(period):
-    # Solcast normally returns PT30M; supports PT15M, PT1H, etc.
-    import re
-    if not isinstance(period, str):
-        return 0.5
-    m = re.fullmatch(r"PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?", period)
-    if not m:
-        return 0.5
-    return float(m.group(1) or 0) + float(m.group(2) or 0) / 60
-
-def api_headers(api_key):
-    return {"Authorization": f"Bearer {api_key.strip()}", "Accept": "application/json"}
-
-def check_authorization(api_key):
-    """Pre-flight checkpoint: confirm the key can access this rooftop site before fetching forecasts."""
-    # Solcast documents forecasts and estimated_actuals for hobbyist rooftop sites;
-    # use estimated_actuals as the pre-flight authentication check.
-    response = requests.get(AUTH_CHECK_URL, headers=api_headers(api_key), timeout=20)
-    if response.status_code == 401:
-        raise ValueError("Authorization failed (401 Unauthorized). Check your Solcast API key.")
-    if response.status_code == 403:
-        raise ValueError("Authorization check failed (403 Forbidden). This key may not have access to this rooftop site.")
-    if response.status_code == 402:
-        raise ValueError("Solcast returned 402 Payment Required during authorization check. Check your account or plan.")
-    if response.status_code == 429:
-        raise ValueError("Solcast returned 429 during the authorization check. The request quota/rate limit may be exhausted; do not retry repeatedly.")
-    response.raise_for_status()
-    return response.json() if response.content else {}
-
-def fetch_forecast(api_key):
-    response = requests.get(
-        API_URL,
-        headers=api_headers(api_key),
-        timeout=30,
-    )
-    if response.status_code == 401:
-        raise ValueError("Solcast rejected the API key (401 Unauthorized). Check the key and try again.")
-    if response.status_code == 403:
-        raise ValueError("Solcast returned 403 Forbidden. Check that your account/key has access to this endpoint.")
-    if response.status_code == 402:
-        raise ValueError("Solcast returned 402 Payment Required. You may have reached an account or plan limit.")
-    if response.status_code == 429:
-        raise ValueError("Solcast rate limit reached (429). Wait until the quota resets before trying again. Response: " + response.text[:500])
-    response.raise_for_status()
-    payload = response.json()
-    rows = payload.get("forecasts")
-    if not isinstance(rows, list):
-        raise ValueError("The response did not contain a 'forecasts' list. Check the API response format.")
-    if not rows:
-        raise ValueError("Solcast returned no forecast intervals.")
-    df = pd.DataFrame(rows)
-    if "period_end" not in df.columns:
-        raise ValueError("Forecast response is missing 'period_end'.")
-    # Current rooftop-site API uses pv_estimate in kW. Keep optional percentile bands if present.
-    for col in ("pv_estimate", "pv_estimate10", "pv_estimate90"):
-        if col not in df.columns:
-            df[col] = pd.NA
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["period"] = df["period"] if "period" in df.columns else "PT30M"
-    df["period_hours"] = df["period"].map(parse_period_hours)
-    df["period_end_utc"] = pd.to_datetime(df["period_end"], utc=True, errors="coerce")
-    df = df.dropna(subset=["period_end_utc", "pv_estimate"]).copy()
-    if df.empty:
-        raise ValueError("No usable pv_estimate values were found in the response.")
-    df["period_start_utc"] = df["period_end_utc"] - pd.to_timedelta(df["period_hours"], unit="h")
-    df["period_end_local"] = df["period_end_utc"].dt.tz_convert(TZ_NAME)
-    df["period_start_local"] = df["period_start_utc"].dt.tz_convert(TZ_NAME)
-    df["local_date"] = df["period_end_local"].dt.date.astype(str)
-    # Integrate average power (kW) across interval length (hours) to estimate energy (kWh).
-    df["energy_kwh"] = df["pv_estimate"] * df["period_hours"]
-    df["energy10_kwh"] = pd.to_numeric(df["pv_estimate10"], errors="coerce") * df["period_hours"]
-    df["energy90_kwh"] = pd.to_numeric(df["pv_estimate90"], errors="coerce") * df["period_hours"]
-    return df, payload
-
-def fetch_estimated_actuals(api_key):
-    response = requests.get(ACTUALS_URL, headers=api_headers(api_key), timeout=30)
-    if response.status_code == 401:
-        raise ValueError("Solcast rejected the API key (401 Unauthorized) for estimated actuals.")
-    if response.status_code == 403:
-        raise ValueError("Solcast returned 403 Forbidden for estimated actuals.")
-    if response.status_code == 402:
-        raise ValueError("Solcast returned 402 Payment Required for estimated actuals.")
-    if response.status_code == 429:
-        raise ValueError("Solcast rate limit reached (429) while fetching estimated actuals. Wait until the quota resets.")
-    response.raise_for_status()
-    payload = response.json()
-    rows = payload.get("estimated_actuals")
-    if not isinstance(rows, list):
-        raise ValueError("The response did not contain an 'estimated_actuals' list.")
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df, payload
-    value_col = "pv_estimate" if "pv_estimate" in df.columns else "pv_power_rooftop"
-    if value_col not in df.columns or "period_end" not in df.columns:
-        raise ValueError("Estimated actuals response is missing power values or 'period_end'.")
-    df["pv_estimate"] = pd.to_numeric(df[value_col], errors="coerce")
-    df["period"] = df["period"] if "period" in df.columns else "PT30M"
-    df["period_end_utc"] = pd.to_datetime(df["period_end"], utc=True, errors="coerce")
-    df = df.dropna(subset=["period_end_utc", "pv_estimate"]).copy()
-    df["period_hours"] = df["period"].map(parse_period_hours)
-    df["period_end_local"] = df["period_end_utc"].dt.tz_convert(TZ_NAME)
-    df["local_date"] = df["period_end_local"].dt.date.astype(str)
-    df["energy_kwh"] = df["pv_estimate"] * df["period_hours"]
-    return df, payload
 
 def save_forecast(df, payload):
     downloaded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -405,6 +283,26 @@ def load_history():
     hist["energy_kwh"] = hist["pv_estimate"] * hist["period_hours"]
     hist["local_date"] = hist["period_end_local"].dt.date.astype(str)
     return hist
+
+def solcast_comparison_forecast(history, latest_forecast, local_date):
+    """Use the latest forecast where available and backfill gaps from saved snapshots."""
+    latest_day = latest_forecast[latest_forecast["local_date"] == local_date].copy()
+    latest_day = latest_day.dropna(subset=["pv_estimate"])
+    latest_day["forecast_source"] = "Latest download"
+
+    latest_stamp = latest_forecast["downloaded_at_utc"].max()
+    previous = history[
+        (history["local_date"] == local_date)
+        & (history["downloaded_at_utc"] < latest_stamp)
+    ].dropna(subset=["pv_estimate"]).copy()
+    previous = (previous.sort_values("downloaded_at_utc", ascending=False)
+                .drop_duplicates("period_end_utc", keep="first"))
+    previous["forecast_source"] = "Earlier saved forecast"
+
+    latest_times = set(latest_day["period_end_utc"])
+    previous = previous[~previous["period_end_utc"].isin(latest_times)]
+    return (pd.concat([latest_day, previous], ignore_index=True)
+            .sort_values("period_end_local"))
 
 def load_openmeteo_hourly():
     conn = connect_db()
@@ -546,64 +444,6 @@ def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
             ))
     conn.close()
 
-def fetch_sigen_day(station_id, day):
-    if not SIGEN_MCP_SCRIPT.exists():
-        raise FileNotFoundError(
-            f"Sigen Open Platform client not found at {SIGEN_MCP_SCRIPT}. "
-            "Set SIGEN_MCP_SCRIPT to the installed sigen.mjs path."
-        )
-    args = {
-        "station_id": int(station_id),
-        "dataset": "energy_statistics",
-        "period": "day",
-        "start_date": day.strftime("%Y%m%d"),
-        "end_date": day.strftime("%Y%m%d"),
-    }
-    result = subprocess.run(
-        ["node", str(SIGEN_MCP_SCRIPT), "call", "get_station_energy_data", json.dumps(args)],
-        capture_output=True, text=True, timeout=120, check=False,
-    )
-    if result.returncode:
-        # CLI diagnostics deliberately avoid exposing Sigen credentials.
-        message = result.stderr.strip() or "Sigen Open Platform request failed."
-        raise RuntimeError(message[-1500:])
-    try:
-        envelope = json.loads(result.stdout)
-        response_text = next(item["text"] for item in envelope["content"] if item.get("type") == "text")
-        payload = json.loads(response_text)
-    except (ValueError, KeyError, StopIteration, TypeError) as exc:
-        raise ValueError("Sigen returned an unexpected energy-statistics response.") from exc
-    if not payload.get("ok"):
-        raise RuntimeError("Sigen did not return energy statistics for this date.")
-    return payload.get("data", {}).get("itemList", [])
-
-def refresh_sigen_actuals(station_id, start_date, end_date):
-    if end_date < start_date:
-        raise ValueError("End date must be on or after start date.")
-    power_rows = []
-    for day in pd.date_range(start_date, end_date, freq="D"):
-        for item in fetch_sigen_day(station_id, day.date()):
-            stamp = pd.to_datetime(item.get("dataTime"), format="%Y%m%d %H:%M", errors="coerce")
-            power_kw = pd.to_numeric(item.get("pvTotalPower"), errors="coerce")
-            if pd.isna(stamp) or pd.isna(power_kw):
-                continue
-            local_stamp = stamp.tz_localize(TZ_NAME, ambiguous="NaT", nonexistent="NaT")
-            if pd.isna(local_stamp):
-                continue
-            raw = json.dumps(item, separators=(",", ":"), ensure_ascii=False)
-            power_rows.append({
-                "period_end_local": local_stamp,
-                "Solar Production (kW)": float(power_kw),
-                "Raw Sigen JSON": raw,
-            })
-    if not power_rows:
-        return 0
-    power_df = pd.DataFrame(power_rows).sort_values("period_end_local")
-    energy_df = power_df[["period_end_local", "Raw Sigen JSON"]].copy()
-    energy_df["Total Solar Production Energy (kWh)"] = power_df["Solar Production (kW)"] * (5 / 60)
-    save_meter_actuals(energy_df, power_df, source_file="Sigen Open Platform")
-    return len(power_df)
-
 def load_meter_actuals():
     conn = connect_db()
     energy = pd.read_sql_query("SELECT period_end_utc, energy_kwh FROM meter_energy_actuals ORDER BY period_end_utc", conn)
@@ -652,11 +492,12 @@ with st.sidebar:
 
     with st.expander("Sigen actuals"):
         st.caption(f"Station {SIGEN_STATION_ID}")
-        sigen_start_date = st.date_input(
+        sigen_start_date = date_picker_with_next(
             "Start date", value=pd.Timestamp("2026-10-01").date(), key="sigen_start_date",
         )
-        sigen_end_date = st.date_input(
+        sigen_end_date = date_picker_with_next(
             "End date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_end_date",
+            min_value=sigen_start_date,
         )
         sigen_update_clicked = st.button(
             "Update power actuals", width="stretch",
@@ -667,7 +508,7 @@ with st.sidebar:
     with st.expander("Amber prices"):
         amber_api_key = os.getenv("AMBER_API_KEY", "").strip()
         st.caption(f"API key {'ready' if amber_api_key else 'missing'}")
-        amber_date = st.date_input(
+        amber_date = date_picker_with_next(
             "Price date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="amber_fetch_date",
         )
         amber_fetch_clicked = st.button(
@@ -759,9 +600,12 @@ if amber_48_clicked:
 if sigen_update_clicked:
     try:
         with st.spinner("Updating meter actuals from Sigen Open Platform…"):
-            sigen_saved = refresh_sigen_actuals(
+            sigen_energy, sigen_power = fetch_sigen_actuals(
                 SIGEN_STATION_ID, sigen_start_date, sigen_end_date,
             )
+            sigen_saved = len(sigen_power)
+            if sigen_saved:
+                save_meter_actuals(sigen_energy, sigen_power, source_file="Sigen Open Platform")
         st.session_state["sigen_update_message"] = (
             f"Updated {sigen_saved:,} five-minute power and energy actuals through "
             f"{sigen_end_date.isoformat()}."
@@ -830,9 +674,9 @@ else:
     amber_prices["local_date"] = amber_prices["start_time_local"].dt.date.astype(str)
     price_dates = sorted(pd.to_datetime(amber_prices["local_date"]).dt.date.unique())
     amber_default = amber_date if amber_date in price_dates else price_dates[-1]
-    amber_date_col, amber_channel_col = st.columns([1, 2])
+    amber_date_col, amber_channel_col = st.columns([2, 3])
     with amber_date_col:
-        amber_chosen_date = st.date_input(
+        amber_chosen_date = date_picker_with_next(
             "Price date (Sydney)", value=amber_default,
             min_value=price_dates[0], max_value=price_dates[-1], key="amber_price_date_picker",
         )
@@ -1163,7 +1007,7 @@ actual_dates = set(actuals["local_date"]) if not actuals.empty else set()
 actual_dates.update(power_actuals["local_date"] if not power_actuals.empty else [])
 overlap_dates = sorted(set(latest["local_date"]).intersection(actual_dates))
 default_date = overlap_dates[-1] if overlap_dates else (available_dates[-1] if available_dates else None)
-chosen_date = st.date_input(
+chosen_date = date_picker_with_next(
     "Solcast comparison date",
     value=pd.Timestamp(default_date).date(),
     min_value=pd.Timestamp(available_dates[0]).date(),
@@ -1269,8 +1113,8 @@ if not intraday.empty:
 if not actual_intraday.empty:
     fig2.add_trace(go.Scatter(
         x=actual_intraday["period_end_local"], y=actual_intraday["pv_estimate"],
-        mode="lines+markers", name="Solcast estimated actual power (kW)",
-        line=dict(width=2, color="#f2a541"), marker=dict(size=5),
+        mode="lines", name="Solcast estimated actual power (kW)",
+        line=dict(width=2, color="#f2a541"),
         customdata=actual_intraday[["forecast_kwh_tooltip", "actual_kwh_tooltip"]].to_numpy(),
         hovertemplate="%{x|%H:%M}<br>Estimated actual: %{y:.2f} kW<br>Forecast energy: %{customdata[0]}<br>Estimated actual energy: %{customdata[1]}<extra></extra>"
     ))
@@ -1313,7 +1157,7 @@ if not default_openmeteo_dates:
     default_openmeteo_dates = complete_openmeteo_dates or all_openmeteo_dates
 if all_openmeteo_dates:
     default_openmeteo_date = default_openmeteo_dates[-1]
-    openmeteo_chosen_date_value = st.date_input(
+    openmeteo_chosen_date_value = date_picker_with_next(
         "Open-Meteo comparison date",
         value=pd.Timestamp(default_openmeteo_date).date(),
         min_value=pd.Timestamp(all_openmeteo_dates[0]).date(),
@@ -1453,8 +1297,8 @@ fig3.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
 st.plotly_chart(fig3, width="stretch")
 
 st.subheader("Solcast vs Open-Meteo forecast power")
-st.caption("Both forecasts are shown in kW at their available timestamps for the same Sydney date.")
-solcast_forecast_dates = set(latest["local_date"])
+st.caption("Both forecasts are shown in kW for the same Sydney date. Missing Solcast points are filled from the newest earlier saved forecast that has that timestamp.")
+solcast_forecast_dates = set(history["local_date"])
 openmeteo_forecast_date_set = set(openmeteo_forecast_hourly["local_date"]) if not openmeteo_forecast_hourly.empty else set()
 forecast_comparison_dates = sorted(solcast_forecast_dates.intersection(openmeteo_forecast_date_set))
 if forecast_comparison_dates:
@@ -1462,26 +1306,29 @@ if forecast_comparison_dates:
         openmeteo_chosen_date if openmeteo_chosen_date in forecast_comparison_dates
         else forecast_comparison_dates[-1]
     )
-    comparison_date = st.selectbox(
-        "Forecast comparison date", forecast_comparison_dates,
-        index=forecast_comparison_dates.index(comparison_default),
+    comparison_date = date_picker_with_next(
+        "Forecast comparison date", pd.Timestamp(comparison_default).date(),
+        min_value=pd.Timestamp(forecast_comparison_dates[0]).date(),
+        max_value=pd.Timestamp(forecast_comparison_dates[-1]).date(),
         key="forecast_comparison_date",
     )
-    solcast_comparison = latest[latest["local_date"] == comparison_date].sort_values("period_end_local")
+    comparison_date = comparison_date.isoformat()
+    solcast_comparison = solcast_comparison_forecast(history, latest, comparison_date)
     openmeteo_comparison = openmeteo_forecast_hourly[
         openmeteo_forecast_hourly["local_date"] == comparison_date
     ].sort_values("time_local")
     comparison_fig = go.Figure()
     comparison_fig.add_trace(go.Scatter(
         x=solcast_comparison["period_end_local"], y=solcast_comparison["pv_estimate"],
+        customdata=solcast_comparison["forecast_source"],
         mode="lines", name="Solcast forecast power (kW)",
         line=dict(width=2, color="#f2a541", dash="dot"),
-        hovertemplate="%{x|%H:%M}<br>Solcast forecast: %{y:.2f} kW<extra></extra>",
+        hovertemplate="%{x|%H:%M}<br>Solcast forecast: %{y:.2f} kW<br>%{customdata}<extra></extra>",
     ))
     comparison_fig.add_trace(go.Scatter(
         x=openmeteo_comparison["time_local"], y=openmeteo_comparison["openmeteo_power_kw"],
-        mode="lines+markers", name="Open-Meteo forecast power (kW)",
-        line=dict(width=2, color="#4c78a8", dash="dot"), marker=dict(size=5),
+        mode="lines", name="Open-Meteo forecast power (kW)",
+        line=dict(width=2, color="#4c78a8", dash="dot"),
         hovertemplate="%{x|%H:%M}<br>Open-Meteo forecast: %{y:.2f} kW<extra></extra>",
     ))
     comparison_fig.update_layout(

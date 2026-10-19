@@ -8,7 +8,10 @@ datas = [
     (str(root / "openmeteo.py"), "."),
 ]
 binaries = []
-hiddenimports = ["streamlit", "streamlit.web.cli", "openmeteo_requests", "requests_cache", "retry_requests"]
+hiddenimports = [
+    "streamlit", "streamlit.web.cli", "openmeteo_requests", "requests_cache", "retry_requests",
+    "solcast_data", "amber_data", "sigen_data",
+]
 for package in ("streamlit", "openmeteo_requests", "requests_cache", "retry_requests"):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas

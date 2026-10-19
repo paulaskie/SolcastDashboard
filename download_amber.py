@@ -7,12 +7,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
+from amber_data import fetch_prices
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
-SITE_ID = "01M4M4A4ZJW5FK6KCP6JKMC10H"
-API_URL = f"https://api.amber.com.au/v1/sites/{SITE_ID}/prices"
 
 
 def main():
@@ -23,18 +21,7 @@ def main():
     if not api_key:
         raise SystemExit("AMBER_API_KEY is not set in this process environment.")
 
-    response = requests.get(
-        API_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-        params={"startDate": args.price_date, "endDate": args.price_date, "resolution": 5},
-        timeout=30,
-    )
-    if response.status_code in (401, 403):
-        raise SystemExit(f"Amber rejected the API key ({response.status_code}); check key and site access.")
-    response.raise_for_status()
-    rows = response.json()
-    if not isinstance(rows, list):
-        raise SystemExit("Amber response was not a list of price intervals.")
+    rows = fetch_prices(api_key, args.price_date)
 
     json_path = APP_DIR / "amber_prices.json"
     temporary_json_path = json_path.with_suffix(".json.tmp")
