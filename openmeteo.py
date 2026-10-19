@@ -262,48 +262,50 @@ print(f"Saved {len(hourly_dataframe)} hourly and {len(daily_dataframe)} daily Op
 
 # Keep weather-model forecasts separate from the satellite archive observations.
 forecast_url = "https://api.open-meteo.com/v1/forecast"
+forecast_start_date = pd.Timestamp.now(tz="Australia/Sydney").date()
 forecast_params = {
 	"latitude": -32.9295,
 	"longitude": 151.7801,
 	"daily": ["sunrise", "sunset", "daylight_duration", "sunshine_duration", "shortwave_radiation_sum"],
-	"hourly": ["shortwave_radiation", "direct_radiation", "diffuse_radiation", "direct_normal_irradiance", "shortwave_radiation_clear_sky", "global_tilted_irradiance", "terrestrial_radiation"],
+	"minutely_15": ["shortwave_radiation", "direct_radiation", "diffuse_radiation", "direct_normal_irradiance", "shortwave_radiation_clear_sky", "global_tilted_irradiance", "terrestrial_radiation"],
 	"timezone": "Australia/Sydney",
 	"tilt": 22,
 	"azimuth": 180,
-	"forecast_days": 7,
+	"start_date": forecast_start_date.isoformat(),
+	"end_date": (forecast_start_date + pd.Timedelta(days=7)).isoformat(),
 }
 forecast_response = openmeteo.weather_api(forecast_url, params=forecast_params)[0]
-east_forecast_params = {**forecast_params, "hourly": ["global_tilted_irradiance"], "daily": [], "azimuth": -90}
+east_forecast_params = {**forecast_params, "minutely_15": ["global_tilted_irradiance"], "daily": [], "azimuth": -90}
 east_forecast_response = openmeteo.weather_api(forecast_url, params=east_forecast_params)[0]
 
-forecast_hourly = forecast_response.Hourly()
-forecast_hourly_times = pd.date_range(
-	start=pd.to_datetime(forecast_hourly.Time(), unit="s", utc=True),
-	end=pd.to_datetime(forecast_hourly.TimeEnd(), unit="s", utc=True),
-	freq=pd.Timedelta(seconds=forecast_hourly.Interval()), inclusive="left",
+forecast_minutely_15 = forecast_response.Minutely15()
+forecast_minutely_15_times = pd.date_range(
+	start=pd.to_datetime(forecast_minutely_15.Time(), unit="s", utc=True),
+	end=pd.to_datetime(forecast_minutely_15.TimeEnd(), unit="s", utc=True),
+	freq=pd.Timedelta(seconds=forecast_minutely_15.Interval()), inclusive="left",
 ).tz_convert(forecast_response.Timezone().decode())
-forecast_hourly_df = pd.DataFrame({
-	"date": forecast_hourly_times,
-	"shortwave_radiation": forecast_hourly.Variables(0).ValuesAsNumpy(),
-	"direct_radiation": forecast_hourly.Variables(1).ValuesAsNumpy(),
-	"diffuse_radiation": forecast_hourly.Variables(2).ValuesAsNumpy(),
-	"direct_normal_irradiance": forecast_hourly.Variables(3).ValuesAsNumpy(),
-	"shortwave_radiation_clear_sky": forecast_hourly.Variables(4).ValuesAsNumpy(),
-	"global_tilted_irradiance": forecast_hourly.Variables(5).ValuesAsNumpy(),
-	"terrestrial_radiation": forecast_hourly.Variables(6).ValuesAsNumpy(),
+forecast_minutely_15_df = pd.DataFrame({
+	"date": forecast_minutely_15_times,
+	"shortwave_radiation": forecast_minutely_15.Variables(0).ValuesAsNumpy(),
+	"direct_radiation": forecast_minutely_15.Variables(1).ValuesAsNumpy(),
+	"diffuse_radiation": forecast_minutely_15.Variables(2).ValuesAsNumpy(),
+	"direct_normal_irradiance": forecast_minutely_15.Variables(3).ValuesAsNumpy(),
+	"shortwave_radiation_clear_sky": forecast_minutely_15.Variables(4).ValuesAsNumpy(),
+	"global_tilted_irradiance": forecast_minutely_15.Variables(5).ValuesAsNumpy(),
+	"terrestrial_radiation": forecast_minutely_15.Variables(6).ValuesAsNumpy(),
 })
-east_forecast_hourly = east_forecast_response.Hourly()
+east_forecast_minutely_15 = east_forecast_response.Minutely15()
 east_forecast_times = pd.date_range(
-	start=pd.to_datetime(east_forecast_hourly.Time(), unit="s", utc=True),
-	end=pd.to_datetime(east_forecast_hourly.TimeEnd(), unit="s", utc=True),
-	freq=pd.Timedelta(seconds=east_forecast_hourly.Interval()), inclusive="left",
+	start=pd.to_datetime(east_forecast_minutely_15.Time(), unit="s", utc=True),
+	end=pd.to_datetime(east_forecast_minutely_15.TimeEnd(), unit="s", utc=True),
+	freq=pd.Timedelta(seconds=east_forecast_minutely_15.Interval()), inclusive="left",
 ).tz_convert(east_forecast_response.Timezone().decode())
-east_forecast_hourly_df = pd.DataFrame({
+east_forecast_minutely_15_df = pd.DataFrame({
 	"date": east_forecast_times,
-	"global_tilted_irradiance_east": east_forecast_hourly.Variables(0).ValuesAsNumpy(),
+	"global_tilted_irradiance_east": east_forecast_minutely_15.Variables(0).ValuesAsNumpy(),
 })
-forecast_hourly_df = forecast_hourly_df.merge(
-	east_forecast_hourly_df, on="date", how="left", validate="one_to_one",
+forecast_minutely_15_df = forecast_minutely_15_df.merge(
+	east_forecast_minutely_15_df, on="date", how="left", validate="one_to_one",
 )
 
 forecast_daily = forecast_response.Daily()
@@ -414,8 +416,8 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 	return fetched_at
 
 
-forecast_fetched_at = save_openmeteo_forecast(forecast_hourly_df, forecast_daily_df, forecast_response)
+forecast_fetched_at = save_openmeteo_forecast(forecast_minutely_15_df, forecast_daily_df, forecast_response)
 print(
-	f"Saved {len(forecast_hourly_df)} hourly and {len(forecast_daily_df)} daily Open-Meteo forecast rows "
+	f"Saved {len(forecast_minutely_15_df)} 15-minute and {len(forecast_daily_df)} daily Open-Meteo forecast rows "
 	f"to {DB_PATH.name} (fetched {forecast_fetched_at} UTC)."
 )
