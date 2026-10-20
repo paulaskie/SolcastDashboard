@@ -7,7 +7,8 @@ from pathlib import Path
 
 def main():
     resource_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    if sys.argv[1:] == ["--openmeteo"]:
+    if sys.argv[1:2] == ["--openmeteo"]:
+        sys.argv = ["openmeteo.py", *sys.argv[2:]]
         runpy.run_path(str(resource_dir / "openmeteo.py"), run_name="__main__")
         return
 

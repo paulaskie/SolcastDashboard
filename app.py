@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import hashlib
 import json
 import subprocess
 import sys
@@ -22,7 +21,6 @@ from sigen_data import fetch_actuals as fetch_sigen_actuals
 from solcast_data import (
     SITE_ID as SITE_ID_DEFAULT,
     TZ_NAME,
-    check_authorization,
     fetch_estimated_actuals,
     fetch_forecast,
     parse_period_hours,
@@ -32,6 +30,7 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
 PV_SYSTEM_CAPACITY_KW = 9.5
 OPENMETEO_DEFAULT_PERFORMANCE_RATIO = 0.80
+OPENMETEO_CALIBRATION_DATE = "2026-10-09"
 
 st.set_page_config(page_title="Solar Forecast", page_icon="☀️", layout="wide")
 
@@ -120,9 +119,11 @@ def connect_db():
             conn.execute(f"ALTER TABLE {table} ADD COLUMN raw_json TEXT NOT NULL DEFAULT '{{}}'")
     return conn
 
-def date_picker_with_next(label, value, key, min_value=None, max_value=None):
-    """Render a calendar picker with a one-day forward button."""
-    current_value = st.session_state.get(key, value)
+def date_picker_with_arrows(label, value, key, min_value=None, max_value=None):
+    """Render a calendar picker with previous-day and next-day arrows."""
+    current_value = st.session_state.get(key)
+    if current_value is None:
+        current_value = value
     if isinstance(current_value, str):
         current_value = pd.Timestamp(current_value).date()
     if min_value is not None and current_value < min_value:
@@ -131,14 +132,27 @@ def date_picker_with_next(label, value, key, min_value=None, max_value=None):
         current_value = max_value
     if key not in st.session_state or st.session_state[key] != current_value:
         st.session_state[key] = current_value
-    picker_col, next_col = st.columns([5, 1], vertical_alignment="bottom")
+    previous_col, picker_col, next_col = st.columns([1, 5, 1], vertical_alignment="bottom")
+    with previous_col:
+        previous_clicked = st.button(
+            "←", key=f"{key}_previous",
+            help="Previous day",
+            disabled=min_value is not None and current_value <= min_value,
+            width="stretch",
+        )
     with next_col:
         next_clicked = st.button(
-            "Next date", key=f"{key}_next",
+            "→", key=f"{key}_next",
+            help="Next day",
             disabled=max_value is not None and current_value >= max_value,
             width="stretch",
         )
-    if next_clicked:
+    if previous_clicked:
+        current_value -= timedelta(days=1)
+        if min_value is not None:
+            current_value = max(current_value, min_value)
+        st.session_state[key] = current_value
+    elif next_clicked:
         current_value += timedelta(days=1)
         if max_value is not None:
             current_value = min(current_value, max_value)
@@ -148,6 +162,13 @@ def date_picker_with_next(label, value, key, min_value=None, max_value=None):
             label, value=None, min_value=min_value, max_value=max_value, key=key,
         )
     return selected_value
+
+def place_legend_below_chart(fig):
+    """Place Plotly legends below the plot area so they fit narrow screens."""
+    fig.update_layout(
+        legend=dict(orientation="h", x=0, y=-0.25, xanchor="left", yanchor="top"),
+        margin=dict(b=90),
+    )
 
 def save_amber_prices(rows):
     fetched_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
@@ -308,9 +329,11 @@ def load_openmeteo_hourly():
     conn = connect_db()
     try:
         weather = pd.read_sql_query(
-            "SELECT time_utc, time_local, global_tilted_irradiance, "
+            "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
             "global_tilted_irradiance_east "
-            "FROM openmeteo_hourly ORDER BY time_utc",
+            "FROM openmeteo_hourly "
+            "WHERE location_key = (SELECT location_key FROM openmeteo_hourly "
+            "ORDER BY fetched_at_utc DESC LIMIT 1) ORDER BY time_utc",
             conn,
         )
     except sqlite3.OperationalError:
@@ -323,9 +346,36 @@ def load_openmeteo_forecast_hourly():
     conn = connect_db()
     try:
         weather = pd.read_sql_query(
+            "WITH ranked_forecasts AS ("
             "SELECT time_utc, time_local, global_tilted_irradiance, "
+            "global_tilted_irradiance_east, fetched_at_utc, "
+            "ROW_NUMBER() OVER (PARTITION BY time_utc "
+            "ORDER BY fetched_at_utc DESC, location_key DESC) AS row_num "
+            "FROM openmeteo_forecast_hourly) "
+            "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
             "global_tilted_irradiance_east "
-            "FROM openmeteo_forecast_hourly ORDER BY time_utc",
+            "FROM ranked_forecasts WHERE row_num = 1 ORDER BY time_utc",
+            conn,
+        )
+    except sqlite3.OperationalError:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+    return prepare_openmeteo_estimates(weather)
+
+def load_openmeteo_historical_forecast_hourly():
+    conn = connect_db()
+    try:
+        weather = pd.read_sql_query(
+            "WITH ranked_forecasts AS ("
+            "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
+            "global_tilted_irradiance_east, "
+            "ROW_NUMBER() OVER (PARTITION BY time_utc "
+            "ORDER BY fetched_at_utc DESC, location_key DESC) AS row_num "
+            "FROM openmeteo_historical_forecast_hourly) "
+            "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
+            "global_tilted_irradiance_east "
+            "FROM ranked_forecasts WHERE row_num = 1 ORDER BY time_utc",
             conn,
         )
     except sqlite3.OperationalError:
@@ -340,7 +390,10 @@ def load_openmeteo_daily():
     for table in ("openmeteo_daily", "openmeteo_forecast_daily"):
         try:
             weather_daily = pd.read_sql_query(
-                f"SELECT date_local, sunrise_local, sunset_local, daylight_duration FROM {table}", conn,
+                f"SELECT date_local, sunrise_local, sunset_local, daylight_duration FROM {table} "
+                f"WHERE location_key = (SELECT location_key FROM {table} "
+                "ORDER BY fetched_at_utc DESC LIMIT 1)",
+                conn,
             )
         except sqlite3.OperationalError:
             continue
@@ -371,11 +424,12 @@ def prepare_openmeteo_estimates(weather):
     weather["global_tilted_irradiance_east"] = pd.to_numeric(
         weather["global_tilted_irradiance_east"], errors="coerce",
     )
+    # Four east panels and sixteen north panels: combine the two GTI series by panel count.
     weather["weighted_panel_irradiance"] = (
-        weather["global_tilted_irradiance"] * 0.80
-        + weather["global_tilted_irradiance_east"] * 0.20
+        weather["global_tilted_irradiance"] * (16 / 20)
+        + weather["global_tilted_irradiance_east"] * (4 / 20)
     )
-    # Plane-weighted GTI is W/m²; scale by array capacity and assumed system PR.
+    # Panel-weighted GTI is W/m²; scale by array capacity and system performance ratio.
     weather["openmeteo_power_kw"] = (
         weather["weighted_panel_irradiance"] / 1000
         * PV_SYSTEM_CAPACITY_KW * OPENMETEO_DEFAULT_PERFORMANCE_RATIO
@@ -409,8 +463,11 @@ def calibrate_openmeteo_performance_ratio(archive_weather, meter_power):
     # Exclude night and very low-light samples, where inverter startup and meter
     # resolution can dominate the ratio.
     calibration = calibration[calibration["base_power_kw"] >= 0.2]
+    calibration = calibration[
+        calibration["time_local"].dt.date == pd.Timestamp(OPENMETEO_CALIBRATION_DATE).date()
+    ]
     day_count = calibration["time_local"].dt.date.nunique()
-    if len(calibration) < 500 or day_count < 3:
+    if len(calibration) < 50 or day_count != 1:
         return OPENMETEO_DEFAULT_PERFORMANCE_RATIO, len(calibration), day_count
 
     base = calibration["base_power_kw"].to_numpy()
@@ -514,34 +571,37 @@ with st.sidebar:
     st.header("Controls")
     st.caption(f"Local database · {DB_PATH.name}")
     api_key = os.getenv("SOLCAST_API_KEY", "").strip()
-    key_fingerprint = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest() if api_key.strip() else ""
-    authorized = bool(key_fingerprint) and st.session_state.get("authorized_key_fingerprint") == key_fingerprint
     with st.expander("Solcast", expanded=True):
         st.caption(f"API key {'ready' if api_key else 'missing'} · Site {SITE_ID_DEFAULT}")
-        check_clicked = st.button(
-            "Check authorization", width="stretch", disabled=not bool(api_key),
-            help="Makes a separate estimated-actuals request and may use API quota.",
-        )
-        if authorized:
-            st.caption("Authorization passed")
-        else:
-            st.caption("Authorize before downloading a forecast.")
         fetch_clicked = st.button(
-            "Download latest forecast", type="primary", width="stretch", disabled=not authorized,
+            "Download latest forecast", type="primary", width="stretch", disabled=not bool(api_key),
         )
 
     with st.expander("Open-Meteo"):
+        openmeteo_latest_archive_date = (
+            pd.Timestamp.now(tz=TZ_NAME).date() - timedelta(days=1)
+        )
+        openmeteo_default_start_date = openmeteo_latest_archive_date - timedelta(days=12)
+        openmeteo_start_date = date_picker_with_arrows(
+            "Archive start date", value=openmeteo_default_start_date,
+            key="openmeteo_archive_start_date", max_value=openmeteo_latest_archive_date,
+        )
+        openmeteo_end_date = date_picker_with_arrows(
+            "Archive end date", value=openmeteo_latest_archive_date,
+            key="openmeteo_archive_end_date", min_value=openmeteo_start_date,
+            max_value=openmeteo_latest_archive_date,
+        )
         openmeteo_refresh_clicked = st.button(
             "Refresh archive and forecast", width="stretch",
-            help="Refreshes archive data from 8 October through the latest available date and fetches a 7-day forecast.",
+            help="Refreshes the selected satellite archive and historical forecast dates, then fetches a 7-day weather forecast.",
         )
 
     with st.expander("Sigen actuals"):
         st.caption(f"Station {SIGEN_STATION_ID}")
-        sigen_start_date = date_picker_with_next(
+        sigen_start_date = date_picker_with_arrows(
             "Start date", value=pd.Timestamp("2026-10-01").date(), key="sigen_start_date",
         )
-        sigen_end_date = date_picker_with_next(
+        sigen_end_date = date_picker_with_arrows(
             "End date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_end_date",
             min_value=sigen_start_date,
         )
@@ -554,7 +614,7 @@ with st.sidebar:
     with st.expander("Amber prices"):
         amber_api_key = os.getenv("AMBER_API_KEY", "").strip()
         st.caption(f"API key {'ready' if amber_api_key else 'missing'}")
-        amber_date = date_picker_with_next(
+        amber_date = date_picker_with_arrows(
             "Price date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="amber_fetch_date",
         )
         amber_fetch_clicked = st.button(
@@ -572,20 +632,28 @@ with st.sidebar:
 
 if openmeteo_refresh_clicked:
     try:
-        with st.spinner("Refreshing Open-Meteo archive and 7-day forecast…"):
+        with st.spinner(
+            f"Refreshing Open-Meteo archive from {openmeteo_start_date} to "
+            f"{openmeteo_end_date} and the 7-day forecast…"
+        ):
             command = ([sys.executable, "--openmeteo"] if getattr(sys, "frozen", False)
                        else [sys.executable, str(APP_DIR / "openmeteo.py")])
+            command.extend([
+                "--start-date", openmeteo_start_date.isoformat(),
+                "--end-date", openmeteo_end_date.isoformat(),
+            ])
             result = subprocess.run(
                 command,
-                cwd=APP_DIR, capture_output=True, text=True, timeout=180,
+                cwd=APP_DIR, capture_output=True, text=True, timeout=300,
             )
         if result.returncode:
             details = result.stderr.strip() or result.stdout.strip() or "Open-Meteo refresh failed."
             st.error(details)
         else:
             st.session_state["openmeteo_refresh_message"] = (
-                result.stdout.strip().splitlines()[-1]
-                if result.stdout.strip() else "Open-Meteo data refreshed."
+                f"Open-Meteo archive and historical forecasts {openmeteo_start_date} to {openmeteo_end_date} refreshed. "
+                + (result.stdout.strip().splitlines()[-1]
+                   if result.stdout.strip() else "Open-Meteo data refreshed.")
             )
             st.rerun()
     except Exception as e:
@@ -663,48 +731,28 @@ if sigen_update_clicked:
 if st.session_state.get("sigen_update_message"):
     st.success(st.session_state.pop("sigen_update_message"))
 
-if check_clicked:
-    st.session_state.pop("authorized_key_fingerprint", None)
-    if not api_key.strip():
-        st.error("Set the SOLCAST_API_KEY environment variable first, then restart the app.")
-    else:
-        try:
-            with st.spinner("Checking authorization for this rooftop site…"):
-                check_authorization(api_key)
-            st.session_state["authorized_key_fingerprint"] = key_fingerprint
-            st.success("Authorization successful. The forecast download is now enabled.")
-            st.rerun()
-        except requests.RequestException as e:
-            st.error(f"Could not complete authorization check: {e}")
-        except Exception as e:
-            st.error(str(e))
-
 if fetch_clicked:
-    # Re-check the authorization checkpoint in code, not just in the button state.
-    if not api_key.strip() or st.session_state.get("authorized_key_fingerprint") != key_fingerprint:
-        st.error("Authorization checkpoint has not passed for SOLCAST_API_KEY. Check authorization first.")
-    else:
+    try:
+        with st.spinner("Downloading forecast from Solcast…"):
+            fresh, payload = fetch_forecast(api_key)
+            stamp = save_forecast(fresh, payload)
+        actuals = pd.DataFrame()
+        actuals_error = None
         try:
-            with st.spinner("Downloading forecast from Solcast…"):
-                fresh, payload = fetch_forecast(api_key)
-                stamp = save_forecast(fresh, payload)
-            actuals = pd.DataFrame()
-            actuals_error = None
-            try:
-                actuals, _ = fetch_estimated_actuals(api_key)
-                save_actuals(actuals, stamp)
-            except Exception as e:
-                actuals_error = str(e)
-            st.session_state["last_download_message"] = f"Saved {len(fresh)} forecast intervals and {len(actuals)} estimated actual intervals at {stamp} UTC."
-            if actuals_error:
-                st.session_state["actuals_download_error"] = actuals_error
-            else:
-                st.session_state.pop("actuals_download_error", None)
-            st.rerun()
-        except requests.RequestException as e:
-            st.error(f"Could not contact Solcast: {e}")
+            actuals, _ = fetch_estimated_actuals(api_key)
+            save_actuals(actuals, stamp)
         except Exception as e:
-            st.error(str(e))
+            actuals_error = str(e)
+        st.session_state["last_download_message"] = f"Saved {len(fresh)} forecast intervals and {len(actuals)} estimated actual intervals at {stamp} UTC."
+        if actuals_error:
+            st.session_state["actuals_download_error"] = actuals_error
+        else:
+            st.session_state.pop("actuals_download_error", None)
+        st.rerun()
+    except requests.RequestException as e:
+        st.error(f"Could not contact Solcast: {e}")
+    except Exception as e:
+        st.error(str(e))
 
 if st.session_state.get("last_download_message"):
     st.success(st.session_state["last_download_message"])
@@ -722,7 +770,7 @@ else:
     amber_default = amber_date if amber_date in price_dates else price_dates[-1]
     amber_date_col, amber_channel_col = st.columns([2, 3])
     with amber_date_col:
-        amber_chosen_date = date_picker_with_next(
+        amber_chosen_date = date_picker_with_arrows(
             "Price date (Sydney)", value=amber_default,
             min_value=price_dates[0], max_value=price_dates[-1], key="amber_price_date_picker",
         )
@@ -861,6 +909,7 @@ else:
         axis_config = dict(title="Price (¢/kWh)", rangemode="tozero")
     price_fig.update_layout(xaxis_title="Time (Sydney)", yaxis=axis_config,
                             margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
+    place_legend_below_chart(price_fig)
     st.plotly_chart(price_fig, width="stretch")
 
 history = load_history()
@@ -881,6 +930,7 @@ latest = latest.sort_values("period_end_local")
 actuals = load_latest_actuals()
 openmeteo_hourly = load_openmeteo_hourly()
 openmeteo_forecast_hourly = load_openmeteo_forecast_hourly()
+openmeteo_historical_forecast_hourly = load_openmeteo_historical_forecast_hourly()
 openmeteo_performance_ratio, performance_ratio_samples, performance_ratio_days = (
     calibrate_openmeteo_performance_ratio(openmeteo_hourly, power_actuals)
 )
@@ -889,6 +939,9 @@ openmeteo_hourly = apply_openmeteo_performance_ratio(
 )
 openmeteo_forecast_hourly = apply_openmeteo_performance_ratio(
     openmeteo_forecast_hourly, openmeteo_performance_ratio,
+)
+openmeteo_historical_forecast_hourly = apply_openmeteo_performance_ratio(
+    openmeteo_historical_forecast_hourly, openmeteo_performance_ratio,
 )
 openmeteo_daily = load_openmeteo_daily()
 daily = daily_summary(latest)
@@ -1033,6 +1086,7 @@ fig.add_trace(go.Scatter(
 fig.update_layout(barmode="stack")
 fig.update_layout(xaxis_title="Date (Sydney)", yaxis_title="Energy (kWh)",
                   margin=dict(l=10, r=10, t=20, b=10), xaxis_tickangle=-35)
+place_legend_below_chart(fig)
 st.plotly_chart(fig, width="stretch")
 
 st.subheader("Non-zero production hours vs daylight duration covered")
@@ -1052,6 +1106,7 @@ sunshine_fig.update_layout(
     barmode="group", xaxis_title="Date (Sydney)", yaxis_title="Hours",
     margin=dict(l=10, r=10, t=20, b=10), xaxis_tickangle=-35,
 )
+place_legend_below_chart(sunshine_fig)
 st.plotly_chart(sunshine_fig, width="stretch")
 
 st.subheader("Solcast Forecast and actual power by time")
@@ -1062,7 +1117,7 @@ actual_dates = set(actuals["local_date"]) if not actuals.empty else set()
 actual_dates.update(power_actuals["local_date"] if not power_actuals.empty else [])
 overlap_dates = sorted(set(latest["local_date"]).intersection(actual_dates))
 default_date = overlap_dates[-1] if overlap_dates else (available_dates[-1] if available_dates else None)
-chosen_date = date_picker_with_next(
+chosen_date = date_picker_with_arrows(
     "Solcast comparison date",
     value=pd.Timestamp(default_date).date(),
     min_value=pd.Timestamp(available_dates[0]).date(),
@@ -1075,6 +1130,37 @@ meter_power_intraday = (power_actuals[power_actuals["local_date"] == chosen_date
                         if not power_actuals.empty else pd.DataFrame())
 def format_kwh(value):
     return f"{value:.3f} kWh" if pd.notna(value) else "—"
+
+def generated_date_label(timestamps):
+    parsed = pd.to_datetime(pd.Series(timestamps), utc=True, errors="coerce").dropna()
+    if parsed.empty:
+        return None
+    return parsed.max().tz_convert(TZ_NAME).strftime("%d %b %Y")
+
+def intervals_cover_full_local_day(period_end_utc, period_hours, local_date):
+    """Return true only when intervals continuously cover the whole local day."""
+    day_start = pd.Timestamp(local_date).tz_localize(TZ_NAME).tz_convert("UTC")
+    day_end = (
+        (pd.Timestamp(local_date) + pd.DateOffset(days=1))
+        .tz_localize(TZ_NAME).tz_convert("UTC")
+    )
+    ends = pd.to_datetime(pd.Series(period_end_utc).reset_index(drop=True), utc=True, errors="coerce")
+    hours = pd.to_numeric(pd.Series(period_hours).reset_index(drop=True), errors="coerce")
+    intervals = pd.DataFrame({
+        "start": ends - pd.to_timedelta(hours, unit="h"),
+        "end": ends,
+    }).dropna().sort_values("start")
+    cursor = day_start
+    tolerance = pd.Timedelta(seconds=1)
+    for row in intervals.itertuples(index=False):
+        if row.end <= cursor:
+            continue
+        if row.start > cursor + tolerance:
+            return False
+        cursor = max(cursor, row.end)
+        if cursor >= day_end - tolerance:
+            return True
+    return False
 
 forecast_energy_by_time = {
     row["period_end_utc"]: row["energy_kwh"] for _, row in intraday.iterrows()
@@ -1128,18 +1214,76 @@ if not solcast_comparison_weather.empty and not meter_power_intraday.empty:
             100 * (1 - abs(solcast_estimate_kwh - solcast_meter_kwh) / solcast_meter_kwh),
         )
 
-solcast_metric_cols = st.columns(3)
+solcast_day_start = pd.Timestamp(chosen_date).tz_localize(TZ_NAME).tz_convert("UTC")
+solcast_day_end = (
+    (pd.Timestamp(chosen_date) + pd.DateOffset(days=1))
+    .tz_localize(TZ_NAME).tz_convert("UTC")
+)
+solcast_full_day_forecast = history[
+    (history["period_end_utc"] > solcast_day_start)
+    & (history["period_end_utc"] <= solcast_day_end)
+].copy()
+solcast_full_day_forecast = (
+    solcast_full_day_forecast.sort_values("downloaded_at_utc", ascending=False)
+    .drop_duplicates("period_end_utc", keep="first")
+    .dropna(subset=["pv_estimate"])
+)
+if actuals.empty:
+    solcast_full_day_actuals = pd.DataFrame(
+        columns=["period_end_utc", "period_hours", "energy_kwh"],
+    )
+else:
+    solcast_full_day_actuals = actuals[
+        (actuals["period_end_utc"] > solcast_day_start)
+        & (actuals["period_end_utc"] <= solcast_day_end)
+    ].copy()
+solcast_full_day_estimate_kwh = None
+solcast_full_day_basis = ""
+solcast_generated_date = None
+actual_period_ends = set(pd.to_datetime(solcast_full_day_actuals["period_end_utc"], utc=True))
+forecast_period_ends = pd.to_datetime(solcast_full_day_forecast["period_end_utc"], utc=True)
+uncovered_forecast = solcast_full_day_forecast.loc[~forecast_period_ends.isin(actual_period_ends)]
+solcast_full_day_intervals = pd.concat([
+    solcast_full_day_actuals[["period_end_utc", "period_hours", "energy_kwh"]],
+    uncovered_forecast[["period_end_utc", "period_hours", "energy_kwh"]],
+], ignore_index=True)
+if not solcast_full_day_intervals.empty and intervals_cover_full_local_day(
+    solcast_full_day_intervals["period_end_utc"],
+    solcast_full_day_intervals["period_hours"],
+    chosen_date,
+):
+    solcast_full_day_estimate_kwh = pd.to_numeric(
+        solcast_full_day_intervals["energy_kwh"], errors="coerce",
+    ).sum()
+    solcast_source_timestamps = pd.concat([
+        solcast_full_day_actuals["downloaded_at_utc"],
+        uncovered_forecast["downloaded_at_utc"],
+    ], ignore_index=True)
+    solcast_generated_date = generated_date_label(solcast_source_timestamps)
+    if not solcast_full_day_actuals.empty and not uncovered_forecast.empty:
+        solcast_full_day_basis = "Solcast estimated actuals plus forecasts for uncovered intervals"
+    elif not solcast_full_day_actuals.empty:
+        solcast_full_day_basis = "Full-day Solcast estimated actuals"
+    else:
+        solcast_full_day_basis = "Full-day saved Solcast forecast"
+
+solcast_metric_cols = st.columns(4)
 solcast_metric_cols[0].metric(
+    "Full-day Solcast estimate" + (f" · {solcast_generated_date}" if solcast_generated_date else ""),
+    f"{solcast_full_day_estimate_kwh:.2f} kWh" if solcast_full_day_estimate_kwh is not None else "—",
+    help=solcast_full_day_basis or "Full-day Solcast data is incomplete or unavailable for the selected date.",
+)
+solcast_metric_cols[1].metric(
     "Solcast estimated actual energy",
     f"{solcast_estimate_kwh:.2f} kWh" if solcast_estimate_kwh is not None else "—",
     help="Estimated energy over five-minute Sigen timestamps that have matching Solcast estimated-actual data.",
 )
-solcast_metric_cols[1].metric(
+solcast_metric_cols[2].metric(
     "Sigen actual energy (matched periods)",
     f"{solcast_meter_kwh:.2f} kWh" if solcast_meter_kwh is not None else "—",
     help="Meter energy over the same matched five-minute periods as the Solcast estimate.",
 )
-solcast_metric_cols[2].metric(
+solcast_metric_cols[3].metric(
     "Solcast estimate accuracy",
     f"{solcast_accuracy_score:.1f}%" if solcast_accuracy_score is not None else "—",
     help="100% minus absolute percentage error against Sigen matched-period energy, floored at 0%.",
@@ -1151,20 +1295,19 @@ elif meter_power_intraday.empty:
 else:
     st.caption("No matching Solcast estimated-actual and Sigen timestamps are available for this date, so the energy comparison and accuracy score are unavailable.")
 fig2 = go.Figure()
-if not intraday.empty:
+solcast_chart_forecast = solcast_comparison_forecast(history, latest, chosen_date)
+if not solcast_chart_forecast.empty:
     fig2.add_trace(go.Scatter(
-        x=intraday["period_end_local"], y=intraday["pv_estimate"],
+        x=solcast_chart_forecast["period_end_local"], y=solcast_chart_forecast["pv_estimate"],
         mode="lines", name="Solcast forecast power (kW)",
-        line=dict(width=2, color="#f2a541", dash="dot"),
-        customdata=intraday[["forecast_kwh_tooltip", "actual_kwh_tooltip"]].to_numpy(),
-        hovertemplate="%{x|%H:%M}<br>Forecast: %{y:.2f} kW<br>Forecast energy: %{customdata[0]}<br>Estimated actual energy: %{customdata[1]}<extra></extra>"
+        line=dict(width=2, color="#7b61a8", dash="dot"),
+        customdata=solcast_chart_forecast[["energy_kwh", "forecast_source"]].to_numpy(),
+        hovertemplate=(
+            "%{x|%H:%M}<br>Forecast: %{y:.2f} kW"
+            "<br>Forecast energy: %{customdata[0]:.3f} kWh"
+            "<br>Source: %{customdata[1]}<extra></extra>"
+        ),
     ))
-    if intraday["pv_estimate10"].notna().any():
-        fig2.add_trace(go.Scatter(x=intraday["period_end_local"], y=intraday["pv_estimate90"],
-                                  mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        fig2.add_trace(go.Scatter(x=intraday["period_end_local"], y=intraday["pv_estimate10"],
-                                  mode="lines", line=dict(width=0), fill="tonexty",
-                                  fillcolor="rgba(100,149,237,0.18)", name="Solcast 10–90% range", hoverinfo="skip"))
 if not actual_intraday.empty:
     fig2.add_trace(go.Scatter(
         x=actual_intraday["period_end_local"], y=actual_intraday["pv_estimate"],
@@ -1181,48 +1324,71 @@ if not meter_power_intraday.empty:
         line=dict(width=2, color="#2a9d8f"),
         hovertemplate="%{x|%H:%M}<br>Meter actual power: %{y:.3f} kW<extra></extra>"
     ))
-if intraday.empty and actual_intraday.empty and meter_power_intraday.empty:
+if solcast_chart_forecast.empty and actual_intraday.empty and meter_power_intraday.empty:
     st.info("No forecast or estimated actual intervals are saved for this date.")
 fig2.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
                    margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
+place_legend_below_chart(fig2)
 st.plotly_chart(fig2, width="stretch")
 
 st.subheader("Open-Meteo estimated and actual power by time")
-if performance_ratio_samples >= 500 and performance_ratio_days >= 3:
+if performance_ratio_samples >= 50 and performance_ratio_days == 1:
     performance_ratio_caption = (
         f"a calibrated {openmeteo_performance_ratio:.3f} ratio from "
-        f"{performance_ratio_samples:,} daylight samples over {performance_ratio_days} days"
+        f"{performance_ratio_samples:,} daylight samples on {OPENMETEO_CALIBRATION_DATE}"
     )
 else:
     performance_ratio_caption = (
         f"the default {OPENMETEO_DEFAULT_PERFORMANCE_RATIO:.2f} ratio "
-        "(not enough overlapping history to calibrate)"
+        f"(need 50 matching daylight samples on {OPENMETEO_CALIBRATION_DATE} to calibrate)"
     )
 st.caption(
-    "Open-Meteo estimates use 22° tilted irradiance weighted for your array: "
-    "80% north-facing and 20% east-facing, scaled to 9.5 kW with "
+    "Open-Meteo estimates weight 22° north- and east-facing tilted irradiance by panel count "
+    "(16 north, 4 east) at -32.9295, 151.7801, scaled to 9.5 kW with "
     f"{performance_ratio_caption}. Actual power comes from the Sigen meter. "
-    "The archive estimate is interpolated to Sigen timestamps; the forecast keeps all 15-minute points for the selected day."
+    "The satellite archive is plotted alongside the hourly historical forecast and the live 15-minute forecast."
 )
 openmeteo_dates = sorted(openmeteo_hourly["local_date"].unique()) if not openmeteo_hourly.empty else []
 openmeteo_forecast_dates = (
     sorted(openmeteo_forecast_hourly["local_date"].unique())
     if not openmeteo_forecast_hourly.empty else []
 )
+openmeteo_historical_forecast_dates = (
+    sorted(openmeteo_historical_forecast_hourly["local_date"].unique())
+    if not openmeteo_historical_forecast_hourly.empty else []
+)
 complete_openmeteo_dates = []
 if openmeteo_dates:
     valid_weather_rows = openmeteo_hourly.groupby("local_date")["global_tilted_irradiance"].count()
     complete_openmeteo_dates = sorted(valid_weather_rows[valid_weather_rows >= 100].index)
 meter_dates = set(power_actuals["local_date"]) if not power_actuals.empty else set()
-all_openmeteo_dates = sorted(set(openmeteo_dates).union(openmeteo_forecast_dates))
+all_openmeteo_dates = sorted(
+    set(openmeteo_dates).union(openmeteo_forecast_dates).union(openmeteo_historical_forecast_dates)
+)
 default_openmeteo_dates = sorted(
     (set(complete_openmeteo_dates).union(openmeteo_forecast_dates)).intersection(meter_dates)
 )
-if not default_openmeteo_dates:
-    default_openmeteo_dates = complete_openmeteo_dates or all_openmeteo_dates
 if all_openmeteo_dates:
-    default_openmeteo_date = default_openmeteo_dates[-1]
-    openmeteo_chosen_date_value = date_picker_with_next(
+    # Open the chart on today's forecast when it is available, so the forecast
+    # trace and full-day estimate are visible without needing to change dates.
+    forecast_dates_from_today = [date for date in openmeteo_forecast_dates if date >= today]
+    if forecast_dates_from_today:
+        default_openmeteo_date = forecast_dates_from_today[0]
+    elif openmeteo_forecast_dates:
+        default_openmeteo_date = openmeteo_forecast_dates[-1]
+    elif openmeteo_historical_forecast_dates:
+        historical_dates_to_today = [
+            date for date in openmeteo_historical_forecast_dates if date <= today
+        ]
+        default_openmeteo_date = (
+            historical_dates_to_today[-1]
+            if historical_dates_to_today else openmeteo_historical_forecast_dates[-1]
+        )
+    elif default_openmeteo_dates:
+        default_openmeteo_date = default_openmeteo_dates[-1]
+    else:
+        default_openmeteo_date = complete_openmeteo_dates[-1] if complete_openmeteo_dates else all_openmeteo_dates[-1]
+    openmeteo_chosen_date_value = date_picker_with_arrows(
         "Open-Meteo comparison date",
         value=pd.Timestamp(default_openmeteo_date).date(),
         min_value=pd.Timestamp(all_openmeteo_dates[0]).date(),
@@ -1240,6 +1406,13 @@ openmeteo_intraday = (
 openmeteo_forecast_intraday = (
     openmeteo_forecast_hourly[openmeteo_forecast_hourly["local_date"] == openmeteo_chosen_date].copy()
     if openmeteo_chosen_date is not None and not openmeteo_forecast_hourly.empty else pd.DataFrame()
+)
+openmeteo_historical_forecast_intraday = (
+    openmeteo_historical_forecast_hourly[
+        openmeteo_historical_forecast_hourly["local_date"] == openmeteo_chosen_date
+    ].copy()
+    if openmeteo_chosen_date is not None and not openmeteo_historical_forecast_hourly.empty
+    else pd.DataFrame()
 )
 meter_openmeteo_intraday = (
     power_actuals[power_actuals["local_date"] == openmeteo_chosen_date].copy()
@@ -1265,8 +1438,13 @@ if not openmeteo_intraday.empty and not meter_openmeteo_intraday.empty:
 
 # Compare estimated and measured energy over the same five-minute Sigen samples.
 comparison_weather = openmeteo_aligned_to_actuals
-if comparison_weather.empty and not openmeteo_forecast_intraday.empty and not meter_openmeteo_intraday.empty:
-    forecast_power = openmeteo_forecast_intraday.set_index("time_local")[["openmeteo_power_kw"]].sort_index()
+forecast_weather_intraday = (
+    openmeteo_historical_forecast_intraday
+    if not openmeteo_historical_forecast_intraday.empty
+    else openmeteo_forecast_intraday
+)
+if comparison_weather.empty and not forecast_weather_intraday.empty and not meter_openmeteo_intraday.empty:
+    forecast_power = forecast_weather_intraday.set_index("time_local")[["openmeteo_power_kw"]].sort_index()
     actual_times = pd.DatetimeIndex(meter_openmeteo_intraday["period_end_local"])
     combined_times = forecast_power.index.union(actual_times).sort_values()
     aligned_forecast = (
@@ -1299,18 +1477,57 @@ if not comparison_weather.empty and not meter_openmeteo_intraday.empty:
             100 * (1 - abs(openmeteo_estimate_kwh - meter_comparison_kwh) / meter_comparison_kwh),
         )
 
-metric_cols = st.columns(3)
+full_day_source = None
+full_day_frame = openmeteo_forecast_intraday
+if not full_day_frame.empty:
+    full_day_source = "Forecast"
+else:
+    full_day_frame = openmeteo_intraday
+    if not full_day_frame.empty:
+        full_day_source = "Satellite archive"
+    else:
+        full_day_frame = openmeteo_historical_forecast_intraday
+        if not full_day_frame.empty:
+            full_day_source = "Historical forecast"
+
+full_day_estimate_kwh = None
+openmeteo_generated_date = None
+if len(full_day_frame) > 1:
+    full_day_frame = full_day_frame.sort_values("time_local")
+    interval_hours = (
+        full_day_frame["time_local"].diff().dt.total_seconds().median() / 3600
+    )
+    if pd.notna(interval_hours) and interval_hours > 0:
+        sample_times = pd.to_datetime(full_day_frame["time_local"], utc=True)
+        sample_ends = sample_times + pd.to_timedelta(interval_hours, unit="h")
+        if intervals_cover_full_local_day(
+            sample_ends, [interval_hours] * len(sample_ends), openmeteo_chosen_date,
+        ):
+            full_day_estimate_kwh = (
+                pd.to_numeric(full_day_frame["openmeteo_power_kw"], errors="coerce").sum()
+                * interval_hours
+            )
+            if "fetched_at_utc" in full_day_frame:
+                openmeteo_generated_date = generated_date_label(full_day_frame["fetched_at_utc"])
+
+metric_cols = st.columns(4)
 metric_cols[0].metric(
+    (f"Full-day Open-Meteo {full_day_source.lower()}" if full_day_source else "Full-day Open-Meteo estimate")
+    + (f" · {openmeteo_generated_date}" if openmeteo_generated_date else ""),
+    f"{full_day_estimate_kwh:.2f} kWh" if full_day_estimate_kwh is not None else "—",
+    help="Full-day energy from the historical forecast, live forecast, or satellite archive. Shows a dash if any part of the selected local day is missing.",
+)
+metric_cols[1].metric(
     "Open-Meteo estimated energy",
     f"{openmeteo_estimate_kwh:.2f} kWh" if openmeteo_estimate_kwh is not None else "—",
     help="Estimated energy over Sigen timestamps that have matching Open-Meteo data.",
 )
-metric_cols[1].metric(
+metric_cols[2].metric(
     "Sigen actual energy (matched periods)",
     f"{meter_comparison_kwh:.2f} kWh" if meter_comparison_kwh is not None else "—",
     help="Meter energy over the same matched five-minute periods as the Open-Meteo estimate.",
 )
-metric_cols[2].metric(
+metric_cols[3].metric(
     "Open-Meteo estimate accuracy",
     f"{accuracy_score:.1f}%" if accuracy_score is not None else "—",
     help="100% minus absolute percentage error against Sigen matched-period energy, floored at 0%.",
@@ -1331,47 +1548,72 @@ if not meter_openmeteo_intraday.empty:
         hovertemplate="%{x|%H:%M}<br>Sigen meter actual: %{y:.3f} kW<extra></extra>"
     ))
 if not openmeteo_intraday.empty:
-    plotted_weather = openmeteo_aligned_to_actuals if not openmeteo_aligned_to_actuals.empty else openmeteo_intraday
+    # Preserve the satellite archive's native time steps and short-term variation.
+    plotted_weather = openmeteo_intraday
     fig3.add_trace(go.Scatter(
         x=plotted_weather["time_local"], y=plotted_weather["openmeteo_power_kw"],
         mode="lines", name="Open-Meteo satellite estimate (kW)",
         line=dict(width=2, color="#f2a541"),
         customdata=plotted_weather["weighted_panel_irradiance"],
         hovertemplate="%{x|%H:%M}<br>Open-Meteo estimate: %{y:.2f} kW"
-                      "<br>80/20 weighted plane irradiance: %{customdata:.0f} W/m²<extra></extra>"
+                      "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
     ))
-if not openmeteo_forecast_intraday.empty:
+if not openmeteo_historical_forecast_intraday.empty:
+    plotted_historical_forecast = openmeteo_historical_forecast_intraday
+    fig3.add_trace(go.Scatter(
+        x=plotted_historical_forecast["time_local"],
+        y=plotted_historical_forecast["openmeteo_power_kw"],
+        mode="lines", name="Open-Meteo historical forecast estimate (kW)",
+        line=dict(width=2, color="#4c78a8", dash="dash"),
+        customdata=plotted_historical_forecast["weighted_panel_irradiance"],
+        hovertemplate=(
+            "%{x|%H:%M}<br>Open-Meteo historical forecast: %{y:.2f} kW"
+            "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
+        ),
+    ))
+if (not openmeteo_forecast_intraday.empty
+        and (openmeteo_chosen_date >= today or openmeteo_historical_forecast_intraday.empty)):
     # Keep every forecast hour visible; Sigen actuals can cover only part of today.
     plotted_forecast = openmeteo_forecast_intraday
     fig3.add_trace(go.Scatter(
         x=plotted_forecast["time_local"], y=plotted_forecast["openmeteo_power_kw"],
         mode="lines", name="Open-Meteo weather forecast estimate (kW)",
-        line=dict(width=2, color="#f2a541", dash="dot"),
+        line=dict(width=2, color="#7b61a8", dash="dash"),
         customdata=plotted_forecast["weighted_panel_irradiance"],
         hovertemplate="%{x|%H:%M}<br>Open-Meteo forecast estimate: %{y:.2f} kW"
-                      "<br>80/20 weighted plane irradiance: %{customdata:.0f} W/m²<extra></extra>"
+                      "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
     ))
-if meter_openmeteo_intraday.empty and openmeteo_intraday.empty and openmeteo_forecast_intraday.empty:
-    st.info("No Sigen, Open-Meteo archive, or Open-Meteo forecast data is saved for this date.")
+if (meter_openmeteo_intraday.empty and openmeteo_intraday.empty
+        and openmeteo_forecast_intraday.empty and openmeteo_historical_forecast_intraday.empty):
+    st.info("No Sigen, Open-Meteo, or Solcast forecast data is saved for this date.")
 if openmeteo_chosen_date is not None:
     chart_day_start = pd.Timestamp(openmeteo_chosen_date).tz_localize(TZ_NAME)
     chart_day_end = chart_day_start + pd.DateOffset(days=1)
     fig3.update_xaxes(range=[chart_day_start, chart_day_end])
 fig3.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
                    margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
+place_legend_below_chart(fig3)
 st.plotly_chart(fig3, width="stretch")
 
 st.subheader("Solcast vs Open-Meteo forecast power")
 st.caption("Both forecasts are shown in kW for the same Sydney date. Missing Solcast points are filled from the newest earlier saved forecast that has that timestamp.")
 solcast_forecast_dates = set(history["local_date"])
 openmeteo_forecast_date_set = set(openmeteo_forecast_hourly["local_date"]) if not openmeteo_forecast_hourly.empty else set()
-forecast_comparison_dates = sorted(solcast_forecast_dates.intersection(openmeteo_forecast_date_set))
+openmeteo_historical_forecast_date_set = (
+    set(openmeteo_historical_forecast_hourly["local_date"])
+    if not openmeteo_historical_forecast_hourly.empty else set()
+)
+forecast_comparison_dates = sorted(
+    solcast_forecast_dates.intersection(
+        openmeteo_forecast_date_set.union(openmeteo_historical_forecast_date_set)
+    )
+)
 if forecast_comparison_dates:
     comparison_default = (
         openmeteo_chosen_date if openmeteo_chosen_date in forecast_comparison_dates
         else forecast_comparison_dates[-1]
     )
-    comparison_date = date_picker_with_next(
+    comparison_date = date_picker_with_arrows(
         "Forecast comparison date", pd.Timestamp(comparison_default).date(),
         min_value=pd.Timestamp(forecast_comparison_dates[0]).date(),
         max_value=pd.Timestamp(forecast_comparison_dates[-1]).date(),
@@ -1379,20 +1621,29 @@ if forecast_comparison_dates:
     )
     comparison_date = comparison_date.isoformat()
     solcast_comparison = solcast_comparison_forecast(history, latest, comparison_date)
-    openmeteo_comparison = openmeteo_forecast_hourly[
-        openmeteo_forecast_hourly["local_date"] == comparison_date
+    openmeteo_comparison_source = (
+        openmeteo_historical_forecast_hourly
+        if comparison_date in openmeteo_historical_forecast_date_set
+        else openmeteo_forecast_hourly
+    )
+    openmeteo_comparison = openmeteo_comparison_source[
+        openmeteo_comparison_source["local_date"] == comparison_date
     ].sort_values("time_local")
     comparison_fig = go.Figure()
     comparison_fig.add_trace(go.Scatter(
         x=solcast_comparison["period_end_local"], y=solcast_comparison["pv_estimate"],
         customdata=solcast_comparison["forecast_source"],
         mode="lines", name="Solcast forecast power (kW)",
-        line=dict(width=2, color="#f2a541", dash="dot"),
+        line=dict(width=2, color="#7b61a8", dash="dot"),
         hovertemplate="%{x|%H:%M}<br>Solcast forecast: %{y:.2f} kW<br>%{customdata}<extra></extra>",
     ))
     comparison_fig.add_trace(go.Scatter(
         x=openmeteo_comparison["time_local"], y=openmeteo_comparison["openmeteo_power_kw"],
-        mode="lines", name="Open-Meteo forecast power (kW)",
+        mode="lines", name=(
+            "Open-Meteo historical forecast power (kW)"
+            if comparison_date in openmeteo_historical_forecast_date_set
+            else "Open-Meteo forecast power (kW)"
+        ),
         line=dict(width=2, color="#4c78a8", dash="dot"),
         hovertemplate="%{x|%H:%M}<br>Open-Meteo forecast: %{y:.2f} kW<extra></extra>",
     ))
@@ -1400,6 +1651,7 @@ if forecast_comparison_dates:
         xaxis_title="Time (Sydney)", yaxis_title="Forecast power (kW)",
         margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
     )
+    place_legend_below_chart(comparison_fig)
     comparison_fig.update_xaxes(
         range=[pd.Timestamp(comparison_date).tz_localize(TZ_NAME),
                pd.Timestamp(comparison_date).tz_localize(TZ_NAME) + pd.DateOffset(days=1)]

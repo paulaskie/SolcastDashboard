@@ -13,6 +13,33 @@ FORECAST_URL = f"{SITE_URL}/forecasts?format=json"
 TZ_NAME = "Australia/Sydney"
 
 
+class SolcastRateLimitError(ValueError):
+    """A Solcast 429 response with its rate limit headers attached."""
+
+    def __init__(self, response, operation):
+        headers = response.headers
+        self.limit = headers.get("X-RateLimit-Limit")
+        self.remaining = headers.get("X-RateLimit-Remaining")
+        self.retry_after = headers.get("Retry-After")
+
+        details = [f"Solcast rate limit reached (429) while {operation}."]
+        if self.limit is not None:
+            details.append(f"Limit: {self.limit} requests in the current window.")
+        if self.remaining is not None:
+            details.append(f"Remaining: {self.remaining}.")
+        if self.retry_after is not None:
+            details.append(f"Retry after {self.retry_after} seconds.")
+        else:
+            details.append("Retry-After was not included in the response.")
+        super().__init__(" ".join(details))
+
+
+def raise_for_rate_limit(response, operation):
+    """Raise a useful error for 429 responses without retrying immediately."""
+    if response.status_code == 429:
+        raise SolcastRateLimitError(response, operation)
+
+
 def parse_period_hours(period):
     """Convert an ISO-8601 Solcast period such as PT30M into hours."""
     if not isinstance(period, str):
@@ -36,8 +63,7 @@ def check_authorization(api_key):
         raise ValueError("Authorization check failed (403 Forbidden). This key may not have access to this rooftop site.")
     if response.status_code == 402:
         raise ValueError("Solcast returned 402 Payment Required during authorization check. Check your account or plan.")
-    if response.status_code == 429:
-        raise ValueError("Solcast returned 429 during the authorization check. The request quota/rate limit may be exhausted; do not retry repeatedly.")
+    raise_for_rate_limit(response, "checking authorization")
     response.raise_for_status()
     return response.json() if response.content else {}
 
@@ -50,8 +76,7 @@ def fetch_forecast(api_key):
         raise ValueError("Solcast returned 403 Forbidden. Check that your account/key has access to this endpoint.")
     if response.status_code == 402:
         raise ValueError("Solcast returned 402 Payment Required. You may have reached an account or plan limit.")
-    if response.status_code == 429:
-        raise ValueError("Solcast rate limit reached (429). Wait until the quota resets before trying again. Response: " + response.text[:500])
+    raise_for_rate_limit(response, "fetching the forecast")
     response.raise_for_status()
     payload = response.json()
     rows = payload.get("forecasts")
@@ -90,8 +115,7 @@ def fetch_estimated_actuals(api_key):
         raise ValueError("Solcast returned 403 Forbidden for estimated actuals.")
     if response.status_code == 402:
         raise ValueError("Solcast returned 402 Payment Required for estimated actuals.")
-    if response.status_code == 429:
-        raise ValueError("Solcast rate limit reached (429) while fetching estimated actuals. Wait until the quota resets.")
+    raise_for_rate_limit(response, "fetching estimated actuals")
     response.raise_for_status()
     payload = response.json()
     rows = payload.get("estimated_actuals")
