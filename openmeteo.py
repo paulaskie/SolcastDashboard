@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import sqlite3
@@ -13,6 +14,20 @@ from retry_requests import retry
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
+LOCATION_LATITUDE = -32.9295
+LOCATION_LONGITUDE = 151.7801
+
+archive_parser = argparse.ArgumentParser(description="Fetch Open-Meteo satellite archive and forecast data.")
+default_archive_end_date = pd.Timestamp.now(tz="Australia/Sydney").date() - pd.Timedelta(days=1)
+archive_parser.add_argument(
+	"--start-date", default=(default_archive_end_date - pd.Timedelta(days=12)).isoformat(),
+)
+archive_parser.add_argument("--end-date", default=default_archive_end_date.isoformat())
+archive_args = archive_parser.parse_args()
+archive_start_date = pd.Timestamp(archive_args.start_date).date()
+archive_end_date = pd.Timestamp(archive_args.end_date).date()
+if archive_end_date < archive_start_date:
+	raise ValueError("Open-Meteo archive end date must be on or after the start date.")
 
 # Setup the Open-Meteo API client with cache and retry on error
 cache_session = requests_cache.CachedSession('.cache', expire_after = 0)
@@ -23,8 +38,8 @@ openmeteo = openmeteo_requests.Client(session = retry_session)
 # The order of variables in hourly or daily is important to assign them correctly below
 url = "https://satellite-api.open-meteo.com/v1/archive"
 params = {
-	"latitude": -32.9295,
-	"longitude": 151.7801,
+	"latitude": LOCATION_LATITUDE,
+	"longitude": LOCATION_LONGITUDE,
 	"daily": ["sunrise", "sunset", "daylight_duration", "sunshine_duration", "shortwave_radiation_sum"],
 	"hourly": ["shortwave_radiation", "direct_radiation", "diffuse_radiation", "direct_normal_irradiance", "shortwave_radiation_clear_sky", "global_tilted_irradiance", "terrestrial_radiation"],
 	"models": "jma_jaxa_himawari",
@@ -32,22 +47,21 @@ params = {
 	"tilt": 22,
 	"azimuth": 180,
 	"temporal_resolution": "native",
-	"start_date": "2026-10-08",
+	"start_date": archive_start_date.isoformat(),
 	# The satellite archive is published with a delay and currently ends at yesterday.
-	"end_date": (pd.Timestamp.now(tz="Australia/Sydney").date() - pd.Timedelta(days=1)).isoformat(),
+	"end_date": archive_end_date.isoformat(),
 }
 responses = openmeteo.weather_api(url, params = params)
 
-# Fetch east-facing tilted irradiance separately; the API accepts one GTI azimuth per request.
+# Fetch east-facing GTI separately; Open-Meteo accepts one azimuth per request.
 east_params = {**params, "hourly": ["global_tilted_irradiance"], "azimuth": -90}
-east_response = openmeteo.weather_api(url, params = east_params)[0]
+east_response = openmeteo.weather_api(url, params=east_params)[0]
 east_hourly = east_response.Hourly()
 east_hourly_dataframe = pd.DataFrame({
 	"date": pd.date_range(
-		start = pd.to_datetime(east_hourly.Time(), unit = "s", utc = True),
-		end = pd.to_datetime(east_hourly.TimeEnd(), unit = "s", utc = True),
-		freq = pd.Timedelta(seconds = east_hourly.Interval()),
-		inclusive = "left",
+		start=pd.to_datetime(east_hourly.Time(), unit="s", utc=True),
+		end=pd.to_datetime(east_hourly.TimeEnd(), unit="s", utc=True),
+		freq=pd.Timedelta(seconds=east_hourly.Interval()), inclusive="left",
 	).tz_convert(east_response.Timezone().decode()),
 	"global_tilted_irradiance_east": east_hourly.Variables(0).ValuesAsNumpy(),
 })
@@ -90,7 +104,7 @@ hourly_data["terrestrial_radiation"] = hourly_terrestrial_radiation
 
 hourly_dataframe = pd.DataFrame(data = hourly_data)
 hourly_dataframe = hourly_dataframe.merge(
-	east_hourly_dataframe, on = "date", how = "left", validate = "one_to_one",
+	east_hourly_dataframe, on="date", how="left", validate="one_to_one",
 )
 
 # Process daily data. The order of variables needs to be the same as requested.
@@ -118,8 +132,28 @@ daily_dataframe = pd.DataFrame(data = daily_data)
 
 
 def ensure_weather_tables(conn):
+	existing_tables = {
+		row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+	}
+	for old_table, new_table in (
+		("openmeteo_hourly", "openmeteo_estimate_hourly"),
+		("openmeteo_daily", "openmeteo_estimate_daily"),
+	):
+		if old_table in existing_tables and new_table not in existing_tables:
+			conn.execute(f'ALTER TABLE "{old_table}" RENAME TO "{new_table}"')
+		elif old_table in existing_tables and new_table in existing_tables:
+			old_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{old_table}")')}
+			new_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{new_table}")')}
+			shared_columns = sorted(old_columns.intersection(new_columns))
+			if shared_columns:
+				columns_sql = ", ".join(f'"{column}"' for column in shared_columns)
+				conn.execute(
+					f'INSERT OR IGNORE INTO "{new_table}" ({columns_sql}) '
+					f'SELECT {columns_sql} FROM "{old_table}"'
+				)
+			conn.execute(f'DROP TABLE "{old_table}"')
 	conn.execute("""
-		CREATE TABLE IF NOT EXISTS openmeteo_hourly (
+		CREATE TABLE IF NOT EXISTS openmeteo_estimate_hourly (
 			location_key TEXT NOT NULL,
 			time_utc TEXT NOT NULL,
 			time_local TEXT NOT NULL,
@@ -141,11 +175,11 @@ def ensure_weather_tables(conn):
 			PRIMARY KEY (location_key, time_utc)
 		)
 	""")
-	hourly_columns = {row[1] for row in conn.execute("PRAGMA table_info(openmeteo_hourly)")}
+	hourly_columns = {row[1] for row in conn.execute("PRAGMA table_info(openmeteo_estimate_hourly)")}
 	if "global_tilted_irradiance_east" not in hourly_columns:
-		conn.execute("ALTER TABLE openmeteo_hourly ADD COLUMN global_tilted_irradiance_east REAL")
+		conn.execute("ALTER TABLE openmeteo_estimate_hourly ADD COLUMN global_tilted_irradiance_east REAL")
 	conn.execute("""
-		CREATE TABLE IF NOT EXISTS openmeteo_daily (
+		CREATE TABLE IF NOT EXISTS openmeteo_estimate_daily (
 			location_key TEXT NOT NULL,
 			date_local TEXT NOT NULL,
 			sunrise_local TEXT,
@@ -192,7 +226,7 @@ def save_openmeteo_data(hourly_df, daily_df):
 	with conn:
 		# Correct legacy daily keys if a timezone/DST conversion labeled them by the prior day.
 		conn.execute("""
-			DELETE FROM openmeteo_daily
+			DELETE FROM openmeteo_estimate_daily
 			WHERE location_key = ? AND date_local <> substr(sunrise_local, 1, 10)
 		""", (location_key,))
 		for _, row in hourly_df.iterrows():
@@ -201,7 +235,7 @@ def save_openmeteo_data(hourly_df, daily_df):
 			values = {key: json_value(row[key]) for key in hourly_df.columns if key != "date"}
 			raw = json.dumps({**metadata, "time_local": local_time.isoformat(), **values}, separators=(",", ":"))
 			conn.execute("""
-				INSERT INTO openmeteo_hourly
+				INSERT INTO openmeteo_estimate_hourly
 			(location_key, time_utc, time_local, shortwave_radiation, direct_radiation,
 			 diffuse_radiation, direct_normal_irradiance, shortwave_radiation_clear_sky,
 			 global_tilted_irradiance, global_tilted_irradiance_east, terrestrial_radiation, latitude, longitude,
@@ -233,7 +267,7 @@ def save_openmeteo_data(hourly_df, daily_df):
 			values = {key: json_value(row[key]) for key in daily_df.columns if key != "date"}
 			raw = json.dumps({**metadata, "date_local": local_date, **values}, separators=(",", ":"))
 			conn.execute("""
-				INSERT INTO openmeteo_daily
+				INSERT INTO openmeteo_estimate_daily
 				(location_key, date_local, sunrise_local, sunset_local, daylight_duration,
 				 sunshine_duration, shortwave_radiation_sum, latitude, longitude, elevation_m,
 				 timezone, model, fetched_at_utc, raw_json)
@@ -264,8 +298,8 @@ print(f"Saved {len(hourly_dataframe)} hourly and {len(daily_dataframe)} daily Op
 forecast_url = "https://api.open-meteo.com/v1/forecast"
 forecast_start_date = pd.Timestamp.now(tz="Australia/Sydney").date()
 forecast_params = {
-	"latitude": -32.9295,
-	"longitude": 151.7801,
+	"latitude": LOCATION_LATITUDE,
+	"longitude": LOCATION_LONGITUDE,
 	"daily": ["sunrise", "sunset", "daylight_duration", "sunshine_duration", "shortwave_radiation_sum"],
 	"minutely_15": ["shortwave_radiation", "direct_radiation", "diffuse_radiation", "direct_normal_irradiance", "shortwave_radiation_clear_sky", "global_tilted_irradiance", "terrestrial_radiation"],
 	"timezone": "Australia/Sydney",
@@ -275,7 +309,10 @@ forecast_params = {
 	"end_date": (forecast_start_date + pd.Timedelta(days=7)).isoformat(),
 }
 forecast_response = openmeteo.weather_api(forecast_url, params=forecast_params)[0]
-east_forecast_params = {**forecast_params, "minutely_15": ["global_tilted_irradiance"], "daily": [], "azimuth": -90}
+east_forecast_params = {
+	**forecast_params, "minutely_15": ["global_tilted_irradiance"],
+	"daily": [], "azimuth": -90,
+}
 east_forecast_response = openmeteo.weather_api(forecast_url, params=east_forecast_params)[0]
 
 forecast_minutely_15 = forecast_response.Minutely15()
@@ -307,7 +344,6 @@ east_forecast_minutely_15_df = pd.DataFrame({
 forecast_minutely_15_df = forecast_minutely_15_df.merge(
 	east_forecast_minutely_15_df, on="date", how="left", validate="one_to_one",
 )
-
 forecast_daily = forecast_response.Daily()
 forecast_sunrise = pd.to_datetime(
 	forecast_daily.Variables(0).ValuesInt64AsNumpy(), unit="s", utc=True,
@@ -332,7 +368,7 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 	timezone_name = response.Timezone().decode()
 	model_name = "best_match"
 	location_key = f"{latitude:.4f},{longitude:.4f}:forecast:{model_name}"
-	fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+	fetched_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
 	metadata = {
 		"latitude": latitude, "longitude": longitude, "elevation_m": elevation,
 		"timezone": timezone_name, "model": model_name,
@@ -354,6 +390,14 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 			)
 		""")
 		conn.execute("""
+			CREATE TABLE IF NOT EXISTS openmeteo_forecast_snapshots (
+				location_key TEXT NOT NULL, fetched_at_utc TEXT NOT NULL,
+				time_utc TEXT NOT NULL, time_local TEXT NOT NULL,
+				global_tilted_irradiance REAL, global_tilted_irradiance_east REAL,
+				PRIMARY KEY (location_key, fetched_at_utc, time_utc)
+			)
+		""")
+		conn.execute("""
 			CREATE TABLE IF NOT EXISTS openmeteo_forecast_daily (
 				location_key TEXT NOT NULL, date_local TEXT NOT NULL, sunrise_local TEXT,
 				sunset_local TEXT, daylight_duration REAL, sunshine_duration REAL,
@@ -367,6 +411,16 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 			local_time = pd.Timestamp(row["date"])
 			values = {key: json_value(row[key]) for key in hourly_df.columns if key != "date"}
 			raw = json.dumps({**metadata, "time_local": local_time.isoformat(), **values}, separators=(",", ":"))
+			conn.execute("""
+				INSERT OR IGNORE INTO openmeteo_forecast_snapshots (
+					location_key, fetched_at_utc, time_utc, time_local,
+					global_tilted_irradiance, global_tilted_irradiance_east
+				) VALUES (?, ?, ?, ?, ?, ?)
+			""", (
+				location_key, fetched_at, local_time.tz_convert("UTC").isoformat(),
+				local_time.isoformat(), values.get("global_tilted_irradiance"),
+				values.get("global_tilted_irradiance_east"),
+			))
 			conn.execute("""
 				INSERT INTO openmeteo_forecast_hourly (
 					location_key, time_utc, time_local, shortwave_radiation, direct_radiation,
@@ -420,4 +474,134 @@ forecast_fetched_at = save_openmeteo_forecast(forecast_minutely_15_df, forecast_
 print(
 	f"Saved {len(forecast_minutely_15_df)} 15-minute and {len(forecast_daily_df)} daily Open-Meteo forecast rows "
 	f"to {DB_PATH.name} (fetched {forecast_fetched_at} UTC)."
+)
+
+
+# Fetch the stitched hourly forecast history for the same dates as the satellite archive.
+historical_forecast_url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+historical_forecast_hourly_variables = [
+	"global_tilted_irradiance", "shortwave_radiation", "direct_radiation",
+	"diffuse_radiation", "direct_normal_irradiance", "terrestrial_radiation",
+]
+historical_forecast_params = {
+	"latitude": LOCATION_LATITUDE,
+	"longitude": LOCATION_LONGITUDE,
+	"start_date": archive_start_date.isoformat(),
+	"end_date": archive_end_date.isoformat(),
+	"hourly": historical_forecast_hourly_variables,
+	"timezone": "Australia/Sydney",
+	"tilt": 22,
+	"azimuth": 180,
+}
+historical_forecast_response = openmeteo.weather_api(
+	historical_forecast_url, params=historical_forecast_params,
+)[0]
+historical_forecast_hourly = historical_forecast_response.Hourly()
+historical_forecast_times = pd.date_range(
+	start=pd.to_datetime(historical_forecast_hourly.Time(), unit="s", utc=True),
+	end=pd.to_datetime(historical_forecast_hourly.TimeEnd(), unit="s", utc=True),
+	freq=pd.Timedelta(seconds=historical_forecast_hourly.Interval()), inclusive="left",
+).tz_convert(historical_forecast_response.Timezone().decode())
+historical_forecast_hourly_df = pd.DataFrame({"date": historical_forecast_times})
+for variable_index, variable_name in enumerate(historical_forecast_hourly_variables):
+	historical_forecast_hourly_df[variable_name] = (
+		historical_forecast_hourly.Variables(variable_index).ValuesAsNumpy()
+	)
+
+# Request the east-facing GTI separately to retain the dashboard's 16:4 panel weighting.
+historical_forecast_east_params = {
+	**historical_forecast_params,
+	"hourly": ["global_tilted_irradiance"],
+	"azimuth": -90,
+}
+historical_forecast_east_response = openmeteo.weather_api(
+	historical_forecast_url, params=historical_forecast_east_params,
+)[0]
+historical_forecast_east_hourly = historical_forecast_east_response.Hourly()
+historical_forecast_east_times = pd.date_range(
+	start=pd.to_datetime(historical_forecast_east_hourly.Time(), unit="s", utc=True),
+	end=pd.to_datetime(historical_forecast_east_hourly.TimeEnd(), unit="s", utc=True),
+	freq=pd.Timedelta(seconds=historical_forecast_east_hourly.Interval()), inclusive="left",
+).tz_convert(historical_forecast_east_response.Timezone().decode())
+historical_forecast_east_df = pd.DataFrame({
+	"date": historical_forecast_east_times,
+	"global_tilted_irradiance_east": historical_forecast_east_hourly.Variables(0).ValuesAsNumpy(),
+})
+historical_forecast_hourly_df = historical_forecast_hourly_df.merge(
+	historical_forecast_east_df, on="date", how="left", validate="one_to_one",
+)
+
+
+def save_openmeteo_historical_forecast(hourly_df, response):
+	latitude = response.Latitude()
+	longitude = response.Longitude()
+	elevation = response.Elevation()
+	timezone_name = response.Timezone().decode()
+	model_name = "best_match"
+	location_key = f"{latitude:.4f},{longitude:.4f}:historical_forecast:{model_name}"
+	fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+	metadata = {
+		"latitude": latitude, "longitude": longitude, "elevation_m": elevation,
+		"timezone": timezone_name, "model": model_name,
+		"north_tilt": 22, "north_azimuth": 180,
+		"east_tilt": 22, "east_azimuth": -90,
+		"source": "historical-forecast-api",
+	}
+	columns = [
+		"shortwave_radiation", "direct_radiation", "diffuse_radiation",
+		"direct_normal_irradiance", "global_tilted_irradiance",
+		"global_tilted_irradiance_east", "terrestrial_radiation",
+	]
+	conn = sqlite3.connect(DB_PATH)
+	with conn:
+		conn.execute("""
+			CREATE TABLE IF NOT EXISTS openmeteo_historical_forecast_hourly (
+				location_key TEXT NOT NULL, time_utc TEXT NOT NULL, time_local TEXT NOT NULL,
+				shortwave_radiation REAL, direct_radiation REAL, diffuse_radiation REAL,
+				direct_normal_irradiance REAL, global_tilted_irradiance REAL,
+				global_tilted_irradiance_east REAL, terrestrial_radiation REAL,
+				latitude REAL NOT NULL, longitude REAL NOT NULL, elevation_m REAL,
+				timezone TEXT NOT NULL, model TEXT NOT NULL, fetched_at_utc TEXT NOT NULL,
+				raw_json TEXT NOT NULL, PRIMARY KEY (location_key, time_utc)
+			)
+		""")
+		for _, row in hourly_df.iterrows():
+			local_time = pd.Timestamp(row["date"])
+			values = {key: json_value(row[key]) for key in columns}
+			raw = json.dumps(
+				{**metadata, "time_local": local_time.isoformat(), **values},
+				separators=(",", ":"),
+			)
+			conn.execute("""
+				INSERT INTO openmeteo_historical_forecast_hourly (
+					location_key, time_utc, time_local, shortwave_radiation, direct_radiation,
+					diffuse_radiation, direct_normal_irradiance, global_tilted_irradiance,
+					global_tilted_irradiance_east, terrestrial_radiation, latitude, longitude,
+					elevation_m, timezone, model, fetched_at_utc, raw_json
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(location_key, time_utc) DO UPDATE SET
+					time_local=excluded.time_local,
+					shortwave_radiation=excluded.shortwave_radiation,
+					direct_radiation=excluded.direct_radiation,
+					diffuse_radiation=excluded.diffuse_radiation,
+					direct_normal_irradiance=excluded.direct_normal_irradiance,
+					global_tilted_irradiance=excluded.global_tilted_irradiance,
+					global_tilted_irradiance_east=excluded.global_tilted_irradiance_east,
+					terrestrial_radiation=excluded.terrestrial_radiation,
+					fetched_at_utc=excluded.fetched_at_utc, raw_json=excluded.raw_json
+			""", (
+				location_key, local_time.tz_convert("UTC").isoformat(), local_time.isoformat(),
+				*[values.get(column) for column in columns],
+				latitude, longitude, elevation, timezone_name, model_name, fetched_at, raw,
+			))
+	conn.close()
+	return fetched_at
+
+
+historical_forecast_fetched_at = save_openmeteo_historical_forecast(
+	historical_forecast_hourly_df, historical_forecast_response,
+)
+print(
+	f"Saved {len(historical_forecast_hourly_df)} hourly historical forecast rows "
+	f"to {DB_PATH.name} (fetched {historical_forecast_fetched_at} UTC)."
 )
