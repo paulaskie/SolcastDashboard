@@ -15,7 +15,7 @@ SIGEN_MCP_SCRIPT = Path(os.getenv(
 ))
 
 
-def fetch_day(station_id, day):
+def fetch_day(station_id, day, include_quota=False):
     if not SIGEN_MCP_SCRIPT.exists():
         raise FileNotFoundError(
             f"Sigen Open Platform client not found at {SIGEN_MCP_SCRIPT}. "
@@ -40,16 +40,26 @@ def fetch_day(station_id, day):
         raise ValueError("Sigen returned an unexpected energy-statistics response.") from exc
     if not payload.get("ok"):
         raise RuntimeError("Sigen did not return energy statistics for this date.")
-    return payload.get("data", {}).get("itemList", [])
+    rows = payload.get("data", {}).get("itemList", [])
+    if include_quota:
+        quota = envelope.get("_meta", {}).get("sigen/quota")
+        return rows, quota
+    return rows
 
 
-def fetch_actuals(station_id, start_date, end_date):
+def fetch_actuals(station_id, start_date, end_date, include_quota=False):
     """Fetch a date range and return meter energy and power frames for persistence."""
     if end_date < start_date:
         raise ValueError("End date must be on or after start date.")
     power_rows = []
+    quota = None
     for day in pd.date_range(start_date, end_date, freq="D"):
-        for item in fetch_day(station_id, day.date()):
+        day_result = fetch_day(station_id, day.date(), include_quota=include_quota)
+        if include_quota:
+            day_rows, quota = day_result
+        else:
+            day_rows = day_result
+        for item in day_rows:
             stamp = pd.to_datetime(item.get("dataTime"), format="%Y%m%d %H:%M", errors="coerce")
             power_kw = pd.to_numeric(item.get("pvTotalPower"), errors="coerce")
             if pd.isna(stamp) or pd.isna(power_kw):
@@ -63,8 +73,9 @@ def fetch_actuals(station_id, start_date, end_date):
                 "Raw Sigen JSON": json.dumps(item, separators=(",", ":"), ensure_ascii=False),
             })
     if not power_rows:
-        return pd.DataFrame(), pd.DataFrame()
+        result = (pd.DataFrame(), pd.DataFrame())
+        return (*result, quota) if include_quota else result
     power_df = pd.DataFrame(power_rows).sort_values("period_end_local")
     energy_df = power_df[["period_end_local", "Raw Sigen JSON"]].copy()
     energy_df["Total Solar Production Energy (kWh)"] = power_df["Solar Production (kW)"] * (5 / 60)
-    return energy_df, power_df
+    return (energy_df, power_df, quota) if include_quota else (energy_df, power_df)

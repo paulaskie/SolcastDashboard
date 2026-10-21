@@ -68,7 +68,7 @@ def check_authorization(api_key):
     return response.json() if response.content else {}
 
 
-def fetch_forecast(api_key):
+def fetch_forecast(api_key, include_rate_limit=False):
     response = requests.get(FORECAST_URL, headers=api_headers(api_key), timeout=30)
     if response.status_code == 401:
         raise ValueError("Solcast rejected the API key (401 Unauthorized). Check the key and try again.")
@@ -104,10 +104,12 @@ def fetch_forecast(api_key):
     df["energy_kwh"] = df["pv_estimate"] * df["period_hours"]
     df["energy10_kwh"] = pd.to_numeric(df["pv_estimate10"], errors="coerce") * df["period_hours"]
     df["energy90_kwh"] = pd.to_numeric(df["pv_estimate90"], errors="coerce") * df["period_hours"]
+    if include_rate_limit:
+        return df, payload, response.headers.get("X-RateLimit-Remaining")
     return df, payload
 
 
-def fetch_estimated_actuals(api_key):
+def fetch_estimated_actuals(api_key, include_rate_limit=False):
     response = requests.get(ACTUALS_URL, headers=api_headers(api_key), timeout=30)
     if response.status_code == 401:
         raise ValueError("Solcast rejected the API key (401 Unauthorized) for estimated actuals.")
@@ -123,6 +125,8 @@ def fetch_estimated_actuals(api_key):
         raise ValueError("The response did not contain an 'estimated_actuals' list.")
     df = pd.DataFrame(rows)
     if df.empty:
+        if include_rate_limit:
+            return df, payload, response.headers.get("X-RateLimit-Remaining")
         return df, payload
     value_col = "pv_estimate" if "pv_estimate" in df.columns else "pv_power_rooftop"
     if value_col not in df.columns or "period_end" not in df.columns:
@@ -135,4 +139,6 @@ def fetch_estimated_actuals(api_key):
     df["period_end_local"] = df["period_end_utc"].dt.tz_convert(TZ_NAME)
     df["local_date"] = df["period_end_local"].dt.date.astype(str)
     df["energy_kwh"] = df["pv_estimate"] * df["period_hours"]
+    if include_rate_limit:
+        return df, payload, response.headers.get("X-RateLimit-Remaining")
     return df, payload

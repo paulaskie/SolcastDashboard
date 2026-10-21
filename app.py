@@ -36,8 +36,35 @@ st.set_page_config(page_title="Solar Forecast", page_icon="☀️", layout="wide
 
 def connect_db():
     conn = sqlite3.connect(DB_PATH)
+    table_renames = (
+        ("forecast_intervals", "solcast_forecast_30min"),
+        ("actual_intervals", "solcast_estimate_30min"),
+        ("openmeteo_hourly", "openmeteo_estimate_hourly"),
+        ("openmeteo_daily", "openmeteo_estimate_daily"),
+        ("meter_energy_actuals", "sigen_energy_actuals"),
+        ("meter_power_actuals", "sigen_power_actuals"),
+    )
+    for old_table, new_table in table_renames:
+        existing_tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'",
+            )
+        }
+        if old_table in existing_tables and new_table not in existing_tables:
+            conn.execute(f'ALTER TABLE "{old_table}" RENAME TO "{new_table}"')
+        elif old_table in existing_tables and new_table in existing_tables:
+            old_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{old_table}")')}
+            new_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{new_table}")')}
+            shared_columns = sorted(old_columns.intersection(new_columns))
+            if shared_columns:
+                columns_sql = ", ".join(f'"{column}"' for column in shared_columns)
+                conn.execute(
+                    f'INSERT OR IGNORE INTO "{new_table}" ({columns_sql}) '
+                    f'SELECT {columns_sql} FROM "{old_table}"'
+                )
+            conn.execute(f'DROP TABLE "{old_table}"')
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS forecast_intervals (
+        CREATE TABLE IF NOT EXISTS solcast_forecast_30min (
             downloaded_at_utc TEXT NOT NULL,
             period_end_utc TEXT NOT NULL,
             period TEXT,
@@ -49,7 +76,7 @@ def connect_db():
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS actual_intervals (
+        CREATE TABLE IF NOT EXISTS solcast_estimate_30min (
             downloaded_at_utc TEXT NOT NULL,
             period_end_utc TEXT NOT NULL,
             period TEXT,
@@ -59,7 +86,7 @@ def connect_db():
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS meter_energy_actuals (
+        CREATE TABLE IF NOT EXISTS sigen_energy_actuals (
             period_end_utc TEXT PRIMARY KEY,
             period_end_local TEXT NOT NULL,
             energy_kwh REAL NOT NULL,
@@ -69,7 +96,7 @@ def connect_db():
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS meter_power_actuals (
+        CREATE TABLE IF NOT EXISTS sigen_power_actuals (
             period_end_utc TEXT PRIMARY KEY,
             period_end_local TEXT NOT NULL,
             power_kw REAL NOT NULL,
@@ -113,10 +140,11 @@ def connect_db():
           FROM amber_prices
          WHERE lower(price_type) = 'forecastinterval'
     """)
-    for table in ("meter_energy_actuals", "meter_power_actuals"):
+    for table in ("sigen_energy_actuals", "sigen_power_actuals"):
         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if "raw_json" not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN raw_json TEXT NOT NULL DEFAULT '{{}}'")
+    conn.commit()
     return conn
 
 def date_picker_with_arrows(label, value, key, min_value=None, max_value=None):
@@ -163,12 +191,41 @@ def date_picker_with_arrows(label, value, key, min_value=None, max_value=None):
         )
     return selected_value
 
+def half_width_date_picker_with_arrows(label, value, key, min_value=None, max_value=None):
+    """Render a chart date picker in the left half of the available row."""
+    date_col, _ = st.columns(2)
+    with date_col:
+        return date_picker_with_arrows(label, value, key, min_value, max_value)
+
 def place_legend_below_chart(fig):
     """Place Plotly legends below the plot area so they fit narrow screens."""
     fig.update_layout(
         legend=dict(orientation="h", x=0, y=-0.25, xanchor="left", yanchor="top"),
         margin=dict(b=90),
     )
+
+def resample_meter_power_to_30min(meter_power, local_date):
+    """Return Sigen power averaged into 30-minute bins for one local date."""
+    if meter_power.empty:
+        return pd.DataFrame(columns=["time_local", "Solar Production (kW)"])
+    day_start = pd.Timestamp(local_date).tz_localize(TZ_NAME)
+    day_end = day_start + pd.DateOffset(days=1)
+    half_hour_times = pd.date_range(
+        start=day_start + pd.Timedelta(minutes=30), end=day_end, freq="30min",
+    )
+    meter_samples = meter_power[["period_end_local", "Solar Production (kW)"]].copy()
+    meter_samples["period_end_local"] = pd.to_datetime(meter_samples["period_end_local"])
+    meter_bins = (
+        meter_samples.set_index("period_end_local")["Solar Production (kW)"]
+        .sort_index()
+        .resample("30min", origin=day_start, closed="right", label="right")
+        .agg(["mean", "count"])
+    )
+    resampled_meter = meter_bins["mean"].where(meter_bins["count"] == 6)
+    return pd.DataFrame({
+        "time_local": half_hour_times,
+        "Solar Production (kW)": resampled_meter.reindex(half_hour_times).to_numpy(),
+    })
 
 def save_amber_prices(rows):
     fetched_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
@@ -197,7 +254,7 @@ def save_amber_prices(rows):
     conn.close()
     return fetched_at
 
-def refresh_amber_actuals_since_last_current(api_key):
+def refresh_amber_actuals_since_last_current(api_key, include_rate_limit=False):
     conn = connect_db()
     row = conn.execute(
         "SELECT end_time_utc FROM amber_prices "
@@ -211,11 +268,49 @@ def refresh_amber_actuals_since_last_current(api_key):
     start_utc = pd.to_datetime(row[0], utc=True)
     now_utc = pd.Timestamp.now(tz="UTC")
     if start_utc >= now_utc:
-        return 0
-    rows_to_save = fetch_amber_actuals_between(api_key, start_utc, now_utc)
+        return (0, None) if include_rate_limit else 0
+    result = fetch_amber_actuals_between(
+        api_key, start_utc, now_utc, include_rate_limit=include_rate_limit,
+    )
+    if include_rate_limit:
+        rows_to_save, rate_limit_remaining = result
+    else:
+        rows_to_save = result
     if rows_to_save:
         save_amber_prices(rows_to_save)
-    return len(rows_to_save)
+    return (len(rows_to_save), rate_limit_remaining) if include_rate_limit else len(rows_to_save)
+
+def amber_rate_limit_message(**remaining_by_request):
+    values = [
+        f"{name}: {remaining if remaining is not None else 'not provided'}"
+        for name, remaining in remaining_by_request.items()
+    ]
+    return "Amber RateLimit-Remaining · " + " · ".join(values)
+
+def solcast_rate_limit_message(**remaining_by_request):
+    values = [
+        f"{name}: {remaining if remaining is not None else 'not provided'}"
+        for name, remaining in remaining_by_request.items()
+    ]
+    return "Solcast X-RateLimit-Remaining · " + " · ".join(values)
+
+def sigen_quota_message(quota):
+    if not isinstance(quota, dict):
+        return "Sigen quota remaining: not provided by the client."
+    daily = quota.get("daily", {}).get("remaining")
+    minute = quota.get("minute", {}).get("remaining")
+    burst = quota.get("burst_10_seconds", {}).get("remaining")
+    unit = quota.get("unit") or "resource units"
+    return (
+        f"Sigen quota remaining ({unit}) · daily: {daily if daily is not None else '—'}"
+        f" · minute: {minute if minute is not None else '—'}"
+        f" · 10-second burst: {burst if burst is not None else '—'}"
+    )
+
+def show_amber_rate_limit_from_error(error):
+    remaining = getattr(error, "amber_rate_limit_remaining", None)
+    if remaining is not None:
+        st.caption(amber_rate_limit_message(response=remaining))
 
 def load_amber_prices():
     conn = connect_db()
@@ -239,7 +334,7 @@ def save_forecast(df, payload):
         for _, row in df.iterrows():
             raw = row.to_json(date_format="iso")
             conn.execute("""
-                INSERT OR REPLACE INTO forecast_intervals
+                INSERT OR REPLACE INTO solcast_forecast_30min
                 (downloaded_at_utc, period_end_utc, period, pv_estimate, pv_estimate10, pv_estimate90, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
@@ -261,7 +356,7 @@ def save_actuals(df, downloaded_at):
     with conn:
         for _, row in df.iterrows():
             conn.execute("""
-                INSERT OR REPLACE INTO actual_intervals
+                INSERT OR REPLACE INTO solcast_estimate_30min
                 (downloaded_at_utc, period_end_utc, period, pv_estimate, raw_json)
                 VALUES (?, ?, ?, ?, ?)
             """, (
@@ -275,7 +370,7 @@ def save_actuals(df, downloaded_at):
 
 def load_latest_actuals():
     conn = connect_db()
-    actuals = pd.read_sql_query("SELECT * FROM actual_intervals ORDER BY downloaded_at_utc, period_end_utc", conn)
+    actuals = pd.read_sql_query("SELECT * FROM solcast_estimate_30min ORDER BY downloaded_at_utc, period_end_utc", conn)
     conn.close()
     if actuals.empty:
         return actuals
@@ -293,7 +388,7 @@ def load_latest_actuals():
 
 def load_history():
     conn = connect_db()
-    hist = pd.read_sql_query("SELECT * FROM forecast_intervals ORDER BY downloaded_at_utc, period_end_utc", conn)
+    hist = pd.read_sql_query("SELECT * FROM solcast_forecast_30min ORDER BY downloaded_at_utc, period_end_utc", conn)
     conn.close()
     if hist.empty:
         return hist
@@ -331,8 +426,8 @@ def load_openmeteo_hourly():
         weather = pd.read_sql_query(
             "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
             "global_tilted_irradiance_east "
-            "FROM openmeteo_hourly "
-            "WHERE location_key = (SELECT location_key FROM openmeteo_hourly "
+            "FROM openmeteo_estimate_hourly "
+            "WHERE location_key = (SELECT location_key FROM openmeteo_estimate_hourly "
             "ORDER BY fetched_at_utc DESC LIMIT 1) ORDER BY time_utc",
             conn,
         )
@@ -355,6 +450,21 @@ def load_openmeteo_forecast_hourly():
             "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
             "global_tilted_irradiance_east "
             "FROM ranked_forecasts WHERE row_num = 1 ORDER BY time_utc",
+            conn,
+        )
+    except sqlite3.OperationalError:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+    return prepare_openmeteo_estimates(weather)
+
+def load_openmeteo_forecast_snapshots():
+    conn = connect_db()
+    try:
+        weather = pd.read_sql_query(
+            "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
+            "global_tilted_irradiance_east FROM openmeteo_forecast_snapshots "
+            "ORDER BY fetched_at_utc, time_utc",
             conn,
         )
     except sqlite3.OperationalError:
@@ -387,7 +497,7 @@ def load_openmeteo_historical_forecast_hourly():
 def load_openmeteo_daily():
     conn = connect_db()
     daily_frames = []
-    for table in ("openmeteo_daily", "openmeteo_forecast_daily"):
+    for table in ("openmeteo_estimate_daily", "openmeteo_forecast_daily"):
         try:
             weather_daily = pd.read_sql_query(
                 f"SELECT date_local, sunrise_local, sunset_local, daylight_duration FROM {table} "
@@ -505,7 +615,7 @@ def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
             if not isinstance(raw_json, str) or not raw_json.strip():
                 raw_json = row.to_json(date_format="iso")
             conn.execute("""
-                INSERT INTO meter_energy_actuals
+                INSERT INTO sigen_energy_actuals
                     (period_end_utc, period_end_local, energy_kwh, source_file, imported_at_utc, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(period_end_utc) DO UPDATE SET
@@ -528,7 +638,7 @@ def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
             if not isinstance(raw_json, str) or not raw_json.strip():
                 raw_json = row.to_json(date_format="iso")
             conn.execute("""
-                INSERT INTO meter_power_actuals
+                INSERT INTO sigen_power_actuals
                     (period_end_utc, period_end_local, power_kw, source_file, imported_at_utc, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(period_end_utc) DO UPDATE SET
@@ -549,8 +659,8 @@ def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
 
 def load_meter_actuals():
     conn = connect_db()
-    energy = pd.read_sql_query("SELECT period_end_utc, energy_kwh FROM meter_energy_actuals ORDER BY period_end_utc", conn)
-    power = pd.read_sql_query("SELECT period_end_utc, power_kw FROM meter_power_actuals ORDER BY period_end_utc", conn)
+    energy = pd.read_sql_query("SELECT period_end_utc, energy_kwh FROM sigen_energy_actuals ORDER BY period_end_utc", conn)
+    power = pd.read_sql_query("SELECT period_end_utc, power_kw FROM sigen_power_actuals ORDER BY period_end_utc", conn)
     conn.close()
     if not energy.empty:
         energy["period_end_utc"] = pd.to_datetime(energy["period_end_utc"], utc=True)
@@ -665,8 +775,12 @@ if st.session_state.get("openmeteo_refresh_message"):
 if amber_fetch_clicked:
     try:
         with st.spinner("Fetching prices from Amber…"):
-            amber_rows = fetch_amber_prices(amber_api_key, amber_date.isoformat())
-            amber_current_rows = fetch_amber_current_prices(amber_api_key, next_intervals=576)
+            amber_rows, prices_remaining = fetch_amber_prices(
+                amber_api_key, amber_date.isoformat(), include_rate_limit=True,
+            )
+            amber_current_rows, current_remaining = fetch_amber_current_prices(
+                amber_api_key, next_intervals=576, include_rate_limit=True,
+            )
             save_amber_prices(amber_rows)
             save_amber_prices(amber_current_rows)
         forecast_count = sum(1 for row in amber_current_rows if row.get("type") == "ForecastInterval")
@@ -674,24 +788,36 @@ if amber_fetch_clicked:
             f"Saved {len(amber_rows)} price intervals for {amber_date.isoformat()} and "
             f"{forecast_count} five-minute forecast intervals from the current-prices feed."
         )
+        st.session_state["amber_rate_limit_message"] = amber_rate_limit_message(
+            prices=prices_remaining, current_prices=current_remaining,
+        )
         st.rerun()
     except requests.RequestException as e:
+        show_amber_rate_limit_from_error(e)
         st.error(f"Could not contact Amber: {e}")
     except Exception as e:
         st.error(str(e))
 
 if st.session_state.get("amber_download_message"):
     st.success(st.session_state.pop("amber_download_message"))
+if st.session_state.get("amber_rate_limit_message"):
+    st.caption(st.session_state.pop("amber_rate_limit_message"))
 
 if amber_update_actuals_clicked:
     try:
         with st.spinner("Updating Amber actual prices through now…"):
-            amber_updated_count = refresh_amber_actuals_since_last_current(amber_api_key)
+            amber_updated_count, rate_limit_remaining = refresh_amber_actuals_since_last_current(
+                amber_api_key, include_rate_limit=True,
+            )
         st.session_state["amber_download_message"] = (
             f"Updated {amber_updated_count:,} actual Amber price intervals since the last CurrentInterval."
         )
+        st.session_state["amber_rate_limit_message"] = amber_rate_limit_message(
+            prices=rate_limit_remaining,
+        )
         st.rerun()
     except requests.RequestException as e:
+        show_amber_rate_limit_from_error(e)
         st.error(f"Could not contact Amber: {e}")
     except Exception as e:
         st.error(str(e))
@@ -699,14 +825,20 @@ if amber_update_actuals_clicked:
 if amber_48_clicked:
     try:
         with st.spinner("Fetching the next 48 five-minute periods from Amber…"):
-            amber_48_rows = fetch_amber_current_prices(amber_api_key, next_intervals=48)
+            amber_48_rows, rate_limit_remaining = fetch_amber_current_prices(
+                amber_api_key, next_intervals=48, include_rate_limit=True,
+            )
             save_amber_prices(amber_48_rows)
         forecast_count = sum(1 for row in amber_48_rows if row.get("type") == "ForecastInterval")
         st.session_state["amber_download_message"] = (
             f"Saved {forecast_count} forecast intervals from Amber's next-48-period current-prices feed."
         )
+        st.session_state["amber_rate_limit_message"] = amber_rate_limit_message(
+            current_prices=rate_limit_remaining,
+        )
         st.rerun()
     except requests.RequestException as e:
+        show_amber_rate_limit_from_error(e)
         st.error(f"Could not contact Amber: {e}")
     except Exception as e:
         st.error(str(e))
@@ -714,8 +846,8 @@ if amber_48_clicked:
 if sigen_update_clicked:
     try:
         with st.spinner("Updating meter actuals from Sigen Open Platform…"):
-            sigen_energy, sigen_power = fetch_sigen_actuals(
-                SIGEN_STATION_ID, sigen_start_date, sigen_end_date,
+            sigen_energy, sigen_power, sigen_quota = fetch_sigen_actuals(
+                SIGEN_STATION_ID, sigen_start_date, sigen_end_date, include_quota=True,
             )
             sigen_saved = len(sigen_power)
             if sigen_saved:
@@ -724,26 +856,37 @@ if sigen_update_clicked:
             f"Updated {sigen_saved:,} five-minute power and energy actuals through "
             f"{sigen_end_date.isoformat()}."
         )
+        st.session_state["sigen_quota_message"] = sigen_quota_message(sigen_quota)
         st.rerun()
     except Exception as e:
         st.error(f"Could not update actuals from Sigen: {e}")
 
 if st.session_state.get("sigen_update_message"):
     st.success(st.session_state.pop("sigen_update_message"))
+if st.session_state.get("sigen_quota_message"):
+    st.caption(st.session_state.pop("sigen_quota_message"))
 
 if fetch_clicked:
     try:
         with st.spinner("Downloading forecast from Solcast…"):
-            fresh, payload = fetch_forecast(api_key)
+            fresh, payload, forecast_remaining = fetch_forecast(
+                api_key, include_rate_limit=True,
+            )
             stamp = save_forecast(fresh, payload)
         actuals = pd.DataFrame()
         actuals_error = None
+        actuals_remaining = None
         try:
-            actuals, _ = fetch_estimated_actuals(api_key)
+            actuals, _, actuals_remaining = fetch_estimated_actuals(
+                api_key, include_rate_limit=True,
+            )
             save_actuals(actuals, stamp)
         except Exception as e:
             actuals_error = str(e)
         st.session_state["last_download_message"] = f"Saved {len(fresh)} forecast intervals and {len(actuals)} estimated actual intervals at {stamp} UTC."
+        st.session_state["solcast_rate_limit_message"] = solcast_rate_limit_message(
+            forecast=forecast_remaining, estimated_actuals=actuals_remaining,
+        )
         if actuals_error:
             st.session_state["actuals_download_error"] = actuals_error
         else:
@@ -756,6 +899,8 @@ if fetch_clicked:
 
 if st.session_state.get("last_download_message"):
     st.success(st.session_state["last_download_message"])
+if st.session_state.get("solcast_rate_limit_message"):
+    st.caption(st.session_state.pop("solcast_rate_limit_message"))
 if st.session_state.get("actuals_download_error"):
     st.warning(f"Estimated actuals could not be refreshed; showing the most recently saved actuals, if available. {st.session_state['actuals_download_error']}")
 
@@ -768,7 +913,7 @@ else:
     amber_prices["local_date"] = amber_prices["start_time_local"].dt.date.astype(str)
     price_dates = sorted(pd.to_datetime(amber_prices["local_date"]).dt.date.unique())
     amber_default = amber_date if amber_date in price_dates else price_dates[-1]
-    amber_date_col, amber_channel_col = st.columns([2, 3])
+    amber_date_col, amber_channel_col = st.columns(2)
     with amber_date_col:
         amber_chosen_date = date_picker_with_arrows(
             "Price date (Sydney)", value=amber_default,
@@ -828,6 +973,25 @@ else:
             bucket_start += pd.Timedelta(minutes=5)
     amber_intraday = pd.DataFrame(bucket_rows) if bucket_rows else intervals.iloc[0:0].copy()
     if not amber_intraday.empty:
+        # A forecast can come from an earlier snapshot and extend back to midnight.
+        # Once actual/current prices cover those buckets, only show the dotted
+        # forecast after the latest observed bucket for that channel.
+        latest_observed_bucket = (
+            actual_like.assign(
+                _bucket_start_utc=actual_like["_start_utc"].dt.floor("5min"),
+            )
+            .groupby("channel_type")["_bucket_start_utc"]
+            .max()
+            .to_dict()
+        )
+        if latest_observed_bucket:
+            observed_cutoff = amber_intraday["channel_type"].map(latest_observed_bucket)
+            stale_forecast = (
+                amber_intraday["price_type"].str.lower().eq("forecastinterval")
+                & observed_cutoff.notna()
+                & (amber_intraday["_bucket_start_utc"] <= observed_cutoff)
+            )
+            amber_intraday = amber_intraday[~stale_forecast].copy()
         amber_intraday["_priority"] = amber_intraday["price_type"].str.lower().map(
             {"actualinterval": 0, "currentinterval": 1, "forecastinterval": 2}
         )
@@ -909,6 +1073,9 @@ else:
         axis_config = dict(title="Price (¢/kWh)", rangemode="tozero")
     price_fig.update_layout(xaxis_title="Time (Sydney)", yaxis=axis_config,
                             margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
+    chart_day_start = pd.Timestamp(amber_chosen_date).tz_localize(TZ_NAME)
+    chart_day_end = chart_day_start + pd.DateOffset(days=1)
+    price_fig.update_xaxes(range=[chart_day_start, chart_day_end])
     place_legend_below_chart(price_fig)
     st.plotly_chart(price_fig, width="stretch")
 
@@ -930,6 +1097,7 @@ latest = latest.sort_values("period_end_local")
 actuals = load_latest_actuals()
 openmeteo_hourly = load_openmeteo_hourly()
 openmeteo_forecast_hourly = load_openmeteo_forecast_hourly()
+openmeteo_forecast_snapshots = load_openmeteo_forecast_snapshots()
 openmeteo_historical_forecast_hourly = load_openmeteo_historical_forecast_hourly()
 openmeteo_performance_ratio, performance_ratio_samples, performance_ratio_days = (
     calibrate_openmeteo_performance_ratio(openmeteo_hourly, power_actuals)
@@ -939,6 +1107,9 @@ openmeteo_hourly = apply_openmeteo_performance_ratio(
 )
 openmeteo_forecast_hourly = apply_openmeteo_performance_ratio(
     openmeteo_forecast_hourly, openmeteo_performance_ratio,
+)
+openmeteo_forecast_snapshots = apply_openmeteo_performance_ratio(
+    openmeteo_forecast_snapshots, openmeteo_performance_ratio,
 )
 openmeteo_historical_forecast_hourly = apply_openmeteo_performance_ratio(
     openmeteo_historical_forecast_hourly, openmeteo_performance_ratio,
@@ -1117,7 +1288,7 @@ actual_dates = set(actuals["local_date"]) if not actuals.empty else set()
 actual_dates.update(power_actuals["local_date"] if not power_actuals.empty else [])
 overlap_dates = sorted(set(latest["local_date"]).intersection(actual_dates))
 default_date = overlap_dates[-1] if overlap_dates else (available_dates[-1] if available_dates else None)
-chosen_date = date_picker_with_arrows(
+chosen_date = half_width_date_picker_with_arrows(
     "Solcast comparison date",
     value=pd.Timestamp(default_date).date(),
     min_value=pd.Timestamp(available_dates[0]).date(),
@@ -1324,10 +1495,28 @@ if not meter_power_intraday.empty:
         line=dict(width=2, color="#2a9d8f"),
         hovertemplate="%{x|%H:%M}<br>Meter actual power: %{y:.3f} kW<extra></extra>"
     ))
+meter_power_30min_solcast = resample_meter_power_to_30min(meter_power_intraday, chosen_date)
+if not meter_power_30min_solcast.empty:
+    fig2.add_trace(go.Scatter(
+        x=meter_power_30min_solcast["time_local"],
+        y=meter_power_30min_solcast["Solar Production (kW)"],
+        mode="lines", connectgaps=False,
+        name="Sigen meter actual power (30-minute mean)",
+        line=dict(width=2, color="#006d77", dash="dash"),
+        hovertemplate=(
+            "%{x|%H:%M}<br>Sigen meter 30-minute mean: "
+            "%{y:.3f} kW<extra></extra>"
+        ),
+    ))
 if solcast_chart_forecast.empty and actual_intraday.empty and meter_power_intraday.empty:
     st.info("No forecast or estimated actual intervals are saved for this date.")
 fig2.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
                    margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
+solcast_chart_day_start = pd.Timestamp(chosen_date).tz_localize(TZ_NAME)
+solcast_chart_day_end = solcast_chart_day_start + pd.DateOffset(days=1)
+fig2.update_xaxes(
+    range=[solcast_chart_day_start, solcast_chart_day_end], fixedrange=True,
+)
 place_legend_below_chart(fig2)
 st.plotly_chart(fig2, width="stretch")
 
@@ -1388,7 +1577,7 @@ if all_openmeteo_dates:
         default_openmeteo_date = default_openmeteo_dates[-1]
     else:
         default_openmeteo_date = complete_openmeteo_dates[-1] if complete_openmeteo_dates else all_openmeteo_dates[-1]
-    openmeteo_chosen_date_value = date_picker_with_arrows(
+    openmeteo_chosen_date_value = half_width_date_picker_with_arrows(
         "Open-Meteo comparison date",
         value=pd.Timestamp(default_openmeteo_date).date(),
         min_value=pd.Timestamp(all_openmeteo_dates[0]).date(),
@@ -1538,6 +1727,20 @@ elif meter_openmeteo_intraday.empty:
     st.caption("No Sigen power actuals are available for this date, so the energy comparison and accuracy score are unavailable.")
 else:
     st.caption("No matching Open-Meteo and Sigen timestamps are available for this date, so the energy comparison and accuracy score are unavailable.")
+
+forecast_frequency_source = (
+    openmeteo_forecast_intraday
+    if not openmeteo_forecast_intraday.empty
+    else openmeteo_historical_forecast_intraday
+    if not openmeteo_historical_forecast_intraday.empty
+    else openmeteo_intraday
+)
+sigen_30min_actuals = (
+    resample_meter_power_to_30min(meter_openmeteo_intraday, openmeteo_chosen_date)
+    if not meter_openmeteo_intraday.empty and not forecast_frequency_source.empty
+    else pd.DataFrame(columns=["time_local", "Solar Production (kW)"])
+)
+
 fig3 = go.Figure()
 if not meter_openmeteo_intraday.empty:
     fig3.add_trace(go.Scatter(
@@ -1546,6 +1749,18 @@ if not meter_openmeteo_intraday.empty:
         mode="lines", name="Sigen meter actual power (kW)",
         line=dict(width=2, color="#2a9d8f"),
         hovertemplate="%{x|%H:%M}<br>Sigen meter actual: %{y:.3f} kW<extra></extra>"
+    ))
+if not sigen_30min_actuals.empty:
+    fig3.add_trace(go.Scatter(
+        x=sigen_30min_actuals["time_local"],
+        y=sigen_30min_actuals["Solar Production (kW)"],
+        mode="lines", connectgaps=False,
+        name="Sigen meter actual power (30-minute mean)",
+        line=dict(width=2, color="#006d77", dash="dash"),
+        hovertemplate=(
+            "%{x|%H:%M}<br>Sigen meter 30-minute mean: "
+            "%{y:.3f} kW<extra></extra>"
+        ),
     ))
 if not openmeteo_intraday.empty:
     # Preserve the satellite archive's native time steps and short-term variation.
@@ -1589,11 +1804,74 @@ if (meter_openmeteo_intraday.empty and openmeteo_intraday.empty
 if openmeteo_chosen_date is not None:
     chart_day_start = pd.Timestamp(openmeteo_chosen_date).tz_localize(TZ_NAME)
     chart_day_end = chart_day_start + pd.DateOffset(days=1)
-    fig3.update_xaxes(range=[chart_day_start, chart_day_end])
+    fig3.update_xaxes(range=[chart_day_start, chart_day_end], fixedrange=True)
 fig3.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
                    margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
 place_legend_below_chart(fig3)
 st.plotly_chart(fig3, width="stretch")
+
+st.subheader("Open-Meteo forecast revisions")
+if openmeteo_forecast_snapshots.empty:
+    st.info("Forecast revision history starts after the next Open-Meteo refresh.")
+else:
+    revision_counts = openmeteo_forecast_snapshots.groupby("local_date")["fetched_at_utc"].nunique()
+    revision_dates = sorted(revision_counts[revision_counts >= 2].index)
+    if not revision_dates:
+        snapshot_count = openmeteo_forecast_snapshots["fetched_at_utc"].nunique()
+        st.info(
+            f"Saved {snapshot_count} Open-Meteo forecast run. Refresh again to compare revisions for a day."
+        )
+    else:
+        revision_default = today if today in revision_dates else revision_dates[-1]
+        revision_date = st.selectbox(
+            "Forecast date with multiple saved runs", revision_dates,
+            index=revision_dates.index(revision_default),
+            format_func=lambda value: pd.Timestamp(value).strftime("%d %b %Y"),
+            key="openmeteo_revision_date",
+        )
+        revision_day_rows = openmeteo_forecast_snapshots[
+            openmeteo_forecast_snapshots["local_date"] == revision_date
+        ].copy()
+        run_stamps = sorted(revision_day_rows["fetched_at_utc"].dropna().unique())
+        total_revision_count = len(run_stamps)
+        if total_revision_count > 10:
+            run_stamps = run_stamps[-10:]
+            st.caption(f"Showing the 10 most recent of {total_revision_count} saved forecasts for this day.")
+        else:
+            st.caption(f"Comparing {total_revision_count} saved forecasts for this day; each line is labeled by fetch time.")
+        revision_fig = go.Figure()
+        for run_index, run_stamp in enumerate(run_stamps):
+            run_rows = revision_day_rows[
+                revision_day_rows["fetched_at_utc"] == run_stamp
+            ].sort_values("time_local")
+            run_local_time = pd.to_datetime(run_stamp, utc=True).tz_convert(TZ_NAME)
+            is_latest = run_index == len(run_stamps) - 1
+            revision_fig.add_trace(go.Scatter(
+                x=run_rows["time_local"], y=run_rows["openmeteo_power_kw"],
+                mode="lines",
+                name=f"Fetched {run_local_time.strftime('%d %b %H:%M')}",
+                line=dict(
+                    color=px.colors.qualitative.Plotly[run_index % len(px.colors.qualitative.Plotly)],
+                    width=2.5 if is_latest else 1.5,
+                    dash="solid" if is_latest else "dash",
+                ),
+                customdata=run_rows["weighted_panel_irradiance"],
+                hovertemplate=(
+                    "%{x|%H:%M}<br>Forecast: %{y:.2f} kW"
+                    "<br>Weighted irradiance: %{customdata:.0f} W/m²<extra>%{fullData.name}</extra>"
+                ),
+            ))
+        revision_day_start = pd.Timestamp(revision_date).tz_localize(TZ_NAME)
+        revision_fig.update_layout(
+            xaxis_title="Time (Sydney)", yaxis_title="Forecast power (kW)",
+            margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+        )
+        revision_fig.update_xaxes(
+            range=[revision_day_start, revision_day_start + pd.DateOffset(days=1)],
+            fixedrange=True,
+        )
+        place_legend_below_chart(revision_fig)
+        st.plotly_chart(revision_fig, width="stretch")
 
 st.subheader("Solcast vs Open-Meteo forecast power")
 st.caption("Both forecasts are shown in kW for the same Sydney date. Missing Solcast points are filled from the newest earlier saved forecast that has that timestamp.")
@@ -1613,7 +1891,7 @@ if forecast_comparison_dates:
         openmeteo_chosen_date if openmeteo_chosen_date in forecast_comparison_dates
         else forecast_comparison_dates[-1]
     )
-    comparison_date = date_picker_with_arrows(
+    comparison_date = half_width_date_picker_with_arrows(
         "Forecast comparison date", pd.Timestamp(comparison_default).date(),
         min_value=pd.Timestamp(forecast_comparison_dates[0]).date(),
         max_value=pd.Timestamp(forecast_comparison_dates[-1]).date(),

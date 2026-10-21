@@ -132,8 +132,28 @@ daily_dataframe = pd.DataFrame(data = daily_data)
 
 
 def ensure_weather_tables(conn):
+	existing_tables = {
+		row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+	}
+	for old_table, new_table in (
+		("openmeteo_hourly", "openmeteo_estimate_hourly"),
+		("openmeteo_daily", "openmeteo_estimate_daily"),
+	):
+		if old_table in existing_tables and new_table not in existing_tables:
+			conn.execute(f'ALTER TABLE "{old_table}" RENAME TO "{new_table}"')
+		elif old_table in existing_tables and new_table in existing_tables:
+			old_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{old_table}")')}
+			new_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{new_table}")')}
+			shared_columns = sorted(old_columns.intersection(new_columns))
+			if shared_columns:
+				columns_sql = ", ".join(f'"{column}"' for column in shared_columns)
+				conn.execute(
+					f'INSERT OR IGNORE INTO "{new_table}" ({columns_sql}) '
+					f'SELECT {columns_sql} FROM "{old_table}"'
+				)
+			conn.execute(f'DROP TABLE "{old_table}"')
 	conn.execute("""
-		CREATE TABLE IF NOT EXISTS openmeteo_hourly (
+		CREATE TABLE IF NOT EXISTS openmeteo_estimate_hourly (
 			location_key TEXT NOT NULL,
 			time_utc TEXT NOT NULL,
 			time_local TEXT NOT NULL,
@@ -155,11 +175,11 @@ def ensure_weather_tables(conn):
 			PRIMARY KEY (location_key, time_utc)
 		)
 	""")
-	hourly_columns = {row[1] for row in conn.execute("PRAGMA table_info(openmeteo_hourly)")}
+	hourly_columns = {row[1] for row in conn.execute("PRAGMA table_info(openmeteo_estimate_hourly)")}
 	if "global_tilted_irradiance_east" not in hourly_columns:
-		conn.execute("ALTER TABLE openmeteo_hourly ADD COLUMN global_tilted_irradiance_east REAL")
+		conn.execute("ALTER TABLE openmeteo_estimate_hourly ADD COLUMN global_tilted_irradiance_east REAL")
 	conn.execute("""
-		CREATE TABLE IF NOT EXISTS openmeteo_daily (
+		CREATE TABLE IF NOT EXISTS openmeteo_estimate_daily (
 			location_key TEXT NOT NULL,
 			date_local TEXT NOT NULL,
 			sunrise_local TEXT,
@@ -206,7 +226,7 @@ def save_openmeteo_data(hourly_df, daily_df):
 	with conn:
 		# Correct legacy daily keys if a timezone/DST conversion labeled them by the prior day.
 		conn.execute("""
-			DELETE FROM openmeteo_daily
+			DELETE FROM openmeteo_estimate_daily
 			WHERE location_key = ? AND date_local <> substr(sunrise_local, 1, 10)
 		""", (location_key,))
 		for _, row in hourly_df.iterrows():
@@ -215,7 +235,7 @@ def save_openmeteo_data(hourly_df, daily_df):
 			values = {key: json_value(row[key]) for key in hourly_df.columns if key != "date"}
 			raw = json.dumps({**metadata, "time_local": local_time.isoformat(), **values}, separators=(",", ":"))
 			conn.execute("""
-				INSERT INTO openmeteo_hourly
+				INSERT INTO openmeteo_estimate_hourly
 			(location_key, time_utc, time_local, shortwave_radiation, direct_radiation,
 			 diffuse_radiation, direct_normal_irradiance, shortwave_radiation_clear_sky,
 			 global_tilted_irradiance, global_tilted_irradiance_east, terrestrial_radiation, latitude, longitude,
@@ -247,7 +267,7 @@ def save_openmeteo_data(hourly_df, daily_df):
 			values = {key: json_value(row[key]) for key in daily_df.columns if key != "date"}
 			raw = json.dumps({**metadata, "date_local": local_date, **values}, separators=(",", ":"))
 			conn.execute("""
-				INSERT INTO openmeteo_daily
+				INSERT INTO openmeteo_estimate_daily
 				(location_key, date_local, sunrise_local, sunset_local, daylight_duration,
 				 sunshine_duration, shortwave_radiation_sum, latitude, longitude, elevation_m,
 				 timezone, model, fetched_at_utc, raw_json)
@@ -348,7 +368,7 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 	timezone_name = response.Timezone().decode()
 	model_name = "best_match"
 	location_key = f"{latitude:.4f},{longitude:.4f}:forecast:{model_name}"
-	fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+	fetched_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
 	metadata = {
 		"latitude": latitude, "longitude": longitude, "elevation_m": elevation,
 		"timezone": timezone_name, "model": model_name,
@@ -370,6 +390,14 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 			)
 		""")
 		conn.execute("""
+			CREATE TABLE IF NOT EXISTS openmeteo_forecast_snapshots (
+				location_key TEXT NOT NULL, fetched_at_utc TEXT NOT NULL,
+				time_utc TEXT NOT NULL, time_local TEXT NOT NULL,
+				global_tilted_irradiance REAL, global_tilted_irradiance_east REAL,
+				PRIMARY KEY (location_key, fetched_at_utc, time_utc)
+			)
+		""")
+		conn.execute("""
 			CREATE TABLE IF NOT EXISTS openmeteo_forecast_daily (
 				location_key TEXT NOT NULL, date_local TEXT NOT NULL, sunrise_local TEXT,
 				sunset_local TEXT, daylight_duration REAL, sunshine_duration REAL,
@@ -383,6 +411,16 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 			local_time = pd.Timestamp(row["date"])
 			values = {key: json_value(row[key]) for key in hourly_df.columns if key != "date"}
 			raw = json.dumps({**metadata, "time_local": local_time.isoformat(), **values}, separators=(",", ":"))
+			conn.execute("""
+				INSERT OR IGNORE INTO openmeteo_forecast_snapshots (
+					location_key, fetched_at_utc, time_utc, time_local,
+					global_tilted_irradiance, global_tilted_irradiance_east
+				) VALUES (?, ?, ?, ?, ?, ?)
+			""", (
+				location_key, fetched_at, local_time.tz_convert("UTC").isoformat(),
+				local_time.isoformat(), values.get("global_tilted_irradiance"),
+				values.get("global_tilted_irradiance_east"),
+			))
 			conn.execute("""
 				INSERT INTO openmeteo_forecast_hourly (
 					location_key, time_utc, time_local, shortwave_radiation, direct_radiation,

@@ -30,8 +30,24 @@ def main():
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    existing_tables = {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    if "forecast_intervals" in existing_tables and "solcast_forecast_30min" not in existing_tables:
+        conn.execute('ALTER TABLE "forecast_intervals" RENAME TO "solcast_forecast_30min"')
+    elif "forecast_intervals" in existing_tables and "solcast_forecast_30min" in existing_tables:
+        old_columns = {row[1] for row in conn.execute('PRAGMA table_info("forecast_intervals")')}
+        new_columns = {row[1] for row in conn.execute('PRAGMA table_info("solcast_forecast_30min")')}
+        shared_columns = sorted(old_columns.intersection(new_columns))
+        if shared_columns:
+            columns_sql = ", ".join(f'"{column}"' for column in shared_columns)
+            conn.execute(
+                f'INSERT OR IGNORE INTO "solcast_forecast_30min" ({columns_sql}) '
+                f'SELECT {columns_sql} FROM "forecast_intervals"'
+            )
+        conn.execute('DROP TABLE "forecast_intervals"')
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS forecast_intervals (
+        CREATE TABLE IF NOT EXISTS solcast_forecast_30min (
             downloaded_at_utc TEXT NOT NULL,
             period_end_utc TEXT NOT NULL,
             period TEXT,
@@ -46,7 +62,7 @@ def main():
     with conn:
         for _, row in df.iterrows():
             conn.execute("""
-                INSERT OR REPLACE INTO forecast_intervals
+                INSERT OR REPLACE INTO solcast_forecast_30min
                 (downloaded_at_utc, period_end_utc, period, pv_estimate, pv_estimate10, pv_estimate90, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
