@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -29,6 +29,9 @@ from solcast_data import (
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
 PV_SYSTEM_CAPACITY_KW = 9.5
+SIGEN_BATTERY_CAPACITY_KWH = 24.0
+SIGEN_INVERTER_LIMIT_KW = 10.0
+SIGEN_SITE_EXPORT_LIMIT_KW = max(0.0, float(os.getenv("SIGEN_EXPORT_LIMIT_KW", "10")))
 OPENMETEO_DEFAULT_PERFORMANCE_RATIO = 0.80
 OPENMETEO_CALIBRATION_DATE = "2026-10-09"
 
@@ -90,6 +93,7 @@ def connect_db():
             period_end_utc TEXT PRIMARY KEY,
             period_end_local TEXT NOT NULL,
             energy_kwh REAL NOT NULL,
+            battery_soc REAL,
             source_file TEXT NOT NULL,
             imported_at_utc TEXT NOT NULL,
             raw_json TEXT NOT NULL DEFAULT '{}'
@@ -144,6 +148,21 @@ def connect_db():
         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if "raw_json" not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN raw_json TEXT NOT NULL DEFAULT '{{}}'")
+    energy_columns = {row[1] for row in conn.execute("PRAGMA table_info(sigen_energy_actuals)")}
+    if "battery_soc" not in energy_columns:
+        conn.execute("ALTER TABLE sigen_energy_actuals ADD COLUMN battery_soc REAL")
+    for period_end_utc, raw_json in conn.execute(
+        "SELECT period_end_utc, raw_json FROM sigen_energy_actuals WHERE battery_soc IS NULL"
+    ).fetchall():
+        battery_soc = extract_battery_soc(raw_json)
+        if battery_soc is not None:
+            try:
+                conn.execute(
+                    "UPDATE sigen_energy_actuals SET battery_soc = ? WHERE period_end_utc = ?",
+                    (float(battery_soc), period_end_utc),
+                )
+            except (TypeError, ValueError):
+                pass
     conn.commit()
     return conn
 
@@ -203,6 +222,24 @@ def place_legend_below_chart(fig):
         legend=dict(orientation="h", x=0, y=-0.25, xanchor="left", yanchor="top"),
         margin=dict(b=90),
     )
+
+def merge_time_windows(windows):
+    """Merge overlapping windows so export capacity is never counted twice."""
+    merged = []
+    for start, end in sorted((start, end) for start, end in windows if start < end):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+def overlapping_time_segments(interval_start, interval_end, windows):
+    """Return the portions of a forecast interval covered by scenario windows."""
+    return [
+        (max(interval_start, start), min(interval_end, end))
+        for start, end in windows
+        if max(interval_start, start) < min(interval_end, end)
+    ]
 
 def resample_meter_power_to_30min(meter_power, local_date):
     """Return Sigen power averaged into 30-minute bins for one local date."""
@@ -330,6 +367,42 @@ def load_amber_prices():
 def save_forecast(df, payload):
     downloaded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     conn = connect_db()
+    latest_snapshot = conn.execute(
+        "SELECT MAX(downloaded_at_utc) FROM solcast_forecast_30min"
+    ).fetchone()[0]
+    if latest_snapshot:
+        previous = pd.read_sql_query(
+            "SELECT period_end_utc, period, pv_estimate, pv_estimate10, pv_estimate90 "
+            "FROM solcast_forecast_30min WHERE downloaded_at_utc = ? ORDER BY period_end_utc",
+            conn, params=(latest_snapshot,),
+        )
+        incoming = df.copy()
+        incoming["period_end_utc"] = pd.to_datetime(
+            incoming["period_end_utc"], utc=True, errors="coerce",
+        )
+        previous["period_end_utc"] = pd.to_datetime(
+            previous["period_end_utc"], utc=True, errors="coerce",
+        )
+        incoming = incoming.sort_values("period_end_utc").reset_index(drop=True)
+        previous = previous.sort_values("period_end_utc").reset_index(drop=True)
+        same_forecast = len(incoming) == len(previous)
+        if same_forecast:
+            same_forecast = incoming["period_end_utc"].equals(previous["period_end_utc"])
+        if same_forecast:
+            same_forecast = incoming["period"].fillna("PT30M").astype(str).equals(
+                previous["period"].fillna("PT30M").astype(str)
+            )
+        for column in ("pv_estimate", "pv_estimate10", "pv_estimate90"):
+            if not same_forecast:
+                break
+            incoming_values = pd.to_numeric(incoming[column], errors="coerce").to_numpy(dtype=float)
+            previous_values = pd.to_numeric(previous[column], errors="coerce").to_numpy(dtype=float)
+            same_forecast = np.allclose(
+                incoming_values, previous_values, rtol=1e-9, atol=1e-9, equal_nan=True,
+            )
+        if same_forecast:
+            conn.close()
+            return downloaded_at, False
     with conn:
         for _, row in df.iterrows():
             raw = row.to_json(date_format="iso")
@@ -347,7 +420,7 @@ def save_forecast(df, payload):
                 raw,
             ))
     conn.close()
-    return downloaded_at
+    return downloaded_at, True
 
 def save_actuals(df, downloaded_at):
     if df.empty:
@@ -614,23 +687,31 @@ def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
             raw_json = row.get("Raw Sigen JSON")
             if not isinstance(raw_json, str) or not raw_json.strip():
                 raw_json = row.to_json(date_format="iso")
+            battery_soc = extract_battery_soc(raw_json)
+            try:
+                battery_soc = float(battery_soc) if battery_soc is not None else None
+            except (TypeError, ValueError):
+                battery_soc = None
             conn.execute("""
                 INSERT INTO sigen_energy_actuals
-                    (period_end_utc, period_end_local, energy_kwh, source_file, imported_at_utc, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (period_end_utc, period_end_local, energy_kwh, battery_soc, source_file, imported_at_utc, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(period_end_utc) DO UPDATE SET
                     period_end_local=excluded.period_end_local,
                     energy_kwh=excluded.energy_kwh,
+                    battery_soc=COALESCE(excluded.battery_soc, sigen_energy_actuals.battery_soc),
                     source_file=excluded.source_file,
                     imported_at_utc=excluded.imported_at_utc,
                     raw_json=excluded.raw_json
                 WHERE period_end_local IS NOT excluded.period_end_local
                    OR energy_kwh IS NOT excluded.energy_kwh
+                   OR (excluded.battery_soc IS NOT NULL AND battery_soc IS NOT excluded.battery_soc)
                    OR source_file IS NOT excluded.source_file
                    OR raw_json IS NOT excluded.raw_json
             """, (
                 period_end.tz_convert("UTC").isoformat(), period_end.isoformat(),
-                float(row["Total Solar Production Energy (kWh)"]), energy_source, imported_at, raw_json,
+                float(row["Total Solar Production Energy (kWh)"]), battery_soc,
+                energy_source, imported_at, raw_json,
             ))
         for _, row in power_actuals.iterrows():
             period_end = pd.Timestamp(row["period_end_local"])
@@ -659,7 +740,10 @@ def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
 
 def load_meter_actuals():
     conn = connect_db()
-    energy = pd.read_sql_query("SELECT period_end_utc, energy_kwh FROM sigen_energy_actuals ORDER BY period_end_utc", conn)
+    energy = pd.read_sql_query(
+        "SELECT period_end_utc, energy_kwh, battery_soc, raw_json "
+        "FROM sigen_energy_actuals ORDER BY period_end_utc", conn,
+    )
     power = pd.read_sql_query("SELECT period_end_utc, power_kw FROM sigen_power_actuals ORDER BY period_end_utc", conn)
     conn.close()
     if not energy.empty:
@@ -667,12 +751,47 @@ def load_meter_actuals():
         energy["period_end_local"] = energy["period_end_utc"].dt.tz_convert(TZ_NAME)
         energy["local_date"] = energy["period_end_local"].dt.date.astype(str)
         energy["Total Solar Production Energy (kWh)"] = energy["energy_kwh"]
+        energy["Battery state of charge (%)"] = energy["battery_soc"]
+        energy["Battery state of charge (%)"] = pd.to_numeric(
+            energy["Battery state of charge (%)"], errors="coerce",
+        )
+        energy["load_power_kw"] = energy["raw_json"].map(
+            lambda raw: extract_sigen_value(raw, "loadPower")
+        )
+        energy["load_power_kw"] = pd.to_numeric(energy["load_power_kw"], errors="coerce")
+        energy = energy.drop(columns=["battery_soc", "raw_json"])
     if not power.empty:
         power["period_end_utc"] = pd.to_datetime(power["period_end_utc"], utc=True)
         power["period_end_local"] = power["period_end_utc"].dt.tz_convert(TZ_NAME)
         power["local_date"] = power["period_end_local"].dt.date.astype(str)
         power["Solar Production (kW)"] = power["power_kw"]
     return energy, power
+
+def extract_sigen_value(raw_json, field_name):
+    """Read a numeric field from a stored Sigen energy JSON row."""
+    try:
+        payload = json.loads(raw_json) if isinstance(raw_json, str) else {}
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    normalized_field = "".join(character for character in field_name.lower() if character.isalnum())
+    field_aliases = {
+        "batsoc": {"batsoc", "batterysoc", "stateofcharge", "batterystateofcharge"},
+    }
+    allowed_fields = field_aliases.get(normalized_field, {normalized_field})
+    for key, value in payload.items():
+        normalized_key = "".join(character for character in str(key).lower() if character.isalnum())
+        if normalized_key in allowed_fields:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+def extract_battery_soc(raw_json):
+    """Read battery state of charge from a stored Sigen energy JSON row."""
+    return extract_sigen_value(raw_json, "batSoc")
 
 st.title("☀️ Solar Forecast Dashboard")
 st.caption("Rooftop PV forecast · Daily energy estimates in Australia/Sydney time")
@@ -872,7 +991,7 @@ if fetch_clicked:
             fresh, payload, forecast_remaining = fetch_forecast(
                 api_key, include_rate_limit=True,
             )
-            stamp = save_forecast(fresh, payload)
+            stamp, forecast_saved = save_forecast(fresh, payload)
         actuals = pd.DataFrame()
         actuals_error = None
         actuals_remaining = None
@@ -883,7 +1002,13 @@ if fetch_clicked:
             save_actuals(actuals, stamp)
         except Exception as e:
             actuals_error = str(e)
-        st.session_state["last_download_message"] = f"Saved {len(fresh)} forecast intervals and {len(actuals)} estimated actual intervals at {stamp} UTC."
+        forecast_status = (
+            f"Saved {len(fresh)} forecast intervals"
+            if forecast_saved else "Forecast unchanged; skipped a duplicate forecast revision"
+        )
+        st.session_state["last_download_message"] = (
+            f"{forecast_status} and saved {len(actuals)} estimated actual intervals at {stamp} UTC."
+        )
         st.session_state["solcast_rate_limit_message"] = solcast_rate_limit_message(
             forecast=forecast_remaining, estimated_actuals=actuals_remaining,
         )
@@ -905,7 +1030,80 @@ if st.session_state.get("actuals_download_error"):
     st.warning(f"Estimated actuals could not be refreshed; showing the most recently saved actuals, if available. {st.session_state['actuals_download_error']}")
 
 energy_actuals, power_actuals = load_meter_actuals()
+history = load_history()
+if history.empty:
+    latest = history.copy()
+else:
+    latest_stamp = history["downloaded_at_utc"].max()
+    latest = history[history["downloaded_at_utc"] == latest_stamp].copy()
+    latest = latest.sort_values("period_end_local")
+actuals = load_latest_actuals()
+openmeteo_hourly = load_openmeteo_hourly()
+openmeteo_forecast_hourly = load_openmeteo_forecast_hourly()
+openmeteo_forecast_snapshots = load_openmeteo_forecast_snapshots()
+openmeteo_historical_forecast_hourly = load_openmeteo_historical_forecast_hourly()
+openmeteo_performance_ratio, performance_ratio_samples, performance_ratio_days = (
+    calibrate_openmeteo_performance_ratio(openmeteo_hourly, power_actuals)
+)
+openmeteo_hourly = apply_openmeteo_performance_ratio(
+    openmeteo_hourly, openmeteo_performance_ratio,
+)
+openmeteo_forecast_hourly = apply_openmeteo_performance_ratio(
+    openmeteo_forecast_hourly, openmeteo_performance_ratio,
+)
+openmeteo_forecast_snapshots = apply_openmeteo_performance_ratio(
+    openmeteo_forecast_snapshots, openmeteo_performance_ratio,
+)
+openmeteo_historical_forecast_hourly = apply_openmeteo_performance_ratio(
+    openmeteo_historical_forecast_hourly, openmeteo_performance_ratio,
+)
+openmeteo_daily = load_openmeteo_daily()
 amber_prices = load_amber_prices()
+scenario_default_date = pd.Timestamp.now(tz=TZ_NAME).date()
+scenario_start_date = st.session_state.get(
+    "battery_soc_scenario_start_date_v2", scenario_default_date,
+)
+scenario_start_time = st.session_state.get(
+    "battery_soc_scenario_start_time_v2", dt_time(18, 0),
+)
+scenario_end_date = st.session_state.get(
+    "battery_soc_scenario_end_date_v2", scenario_default_date,
+)
+scenario_end_time = st.session_state.get(
+    "battery_soc_scenario_end_time_v2", dt_time(19, 0),
+)
+scenario_second_enabled = st.session_state.get(
+    "battery_soc_scenario_second_enabled", False,
+)
+scenario_second_start_date = st.session_state.get(
+    "battery_soc_scenario_second_start_date", scenario_default_date,
+)
+scenario_second_start_time = st.session_state.get(
+    "battery_soc_scenario_second_start_time", dt_time(20, 0),
+)
+scenario_second_end_date = st.session_state.get(
+    "battery_soc_scenario_second_end_date", scenario_default_date,
+)
+scenario_second_end_time = st.session_state.get(
+    "battery_soc_scenario_second_end_time", dt_time(21, 0),
+)
+scenario_start = pd.Timestamp(datetime.combine(
+    scenario_start_date, scenario_start_time,
+)).tz_localize(TZ_NAME)
+scenario_end = pd.Timestamp(datetime.combine(
+    scenario_end_date, scenario_end_time,
+)).tz_localize(TZ_NAME)
+scenario_periods = [(scenario_start, scenario_end)]
+if scenario_second_enabled:
+    scenario_periods.append((
+        pd.Timestamp(datetime.combine(
+            scenario_second_start_date, scenario_second_start_time,
+        )).tz_localize(TZ_NAME),
+        pd.Timestamp(datetime.combine(
+            scenario_second_end_date, scenario_second_end_time,
+        )).tz_localize(TZ_NAME),
+    ))
+scenario_periods = merge_time_windows(scenario_periods)
 st.subheader("Amber electricity price over time")
 if amber_prices.empty:
     st.info("No Amber prices are saved yet. Set AMBER_API_KEY and choose **Fetch Amber prices** in the sidebar.")
@@ -1076,10 +1274,593 @@ else:
     chart_day_start = pd.Timestamp(amber_chosen_date).tz_localize(TZ_NAME)
     chart_day_end = chart_day_start + pd.DateOffset(days=1)
     price_fig.update_xaxes(range=[chart_day_start, chart_day_end])
+    for scenario_window_start, scenario_window_end in scenario_periods:
+        scenario_window_start = max(scenario_window_start, chart_day_start)
+        scenario_window_end = min(scenario_window_end, chart_day_end)
+        if scenario_window_start < scenario_window_end:
+            price_fig.add_shape(
+                type="rect", xref="x", yref="paper",
+                x0=scenario_window_start, x1=scenario_window_end,
+                y0=0, y1=1, layer="below",
+                fillcolor="rgba(128,128,128,0.2)", line=dict(width=0),
+            )
     place_legend_below_chart(price_fig)
     st.plotly_chart(price_fig, width="stretch")
 
-history = load_history()
+st.subheader("Sigen battery state of charge")
+battery_soc = (
+    energy_actuals.dropna(subset=["Battery state of charge (%)"])
+    if not energy_actuals.empty else pd.DataFrame()
+)
+if battery_soc.empty:
+    st.info("No battery state-of-charge values were found in sigen_energy_actuals.battery_soc.")
+else:
+    battery_soc_dates = sorted(battery_soc["local_date"].unique())
+    battery_soc_default = battery_soc_dates[-1]
+    forecast_date_candidates = []
+    if not history.empty and "local_date" in history:
+        forecast_date_candidates.extend(history["local_date"].dropna().astype(str).tolist())
+    if not openmeteo_forecast_hourly.empty and "local_date" in openmeteo_forecast_hourly:
+        forecast_date_candidates.extend(
+            openmeteo_forecast_hourly["local_date"].dropna().astype(str).tolist()
+        )
+    latest_selectable_date = max([*battery_soc_dates, *forecast_date_candidates])
+    battery_soc_date = half_width_date_picker_with_arrows(
+        "Battery SOC date", pd.Timestamp(battery_soc_default).date(),
+        min_value=pd.Timestamp(battery_soc_dates[0]).date(),
+        max_value=pd.Timestamp(latest_selectable_date).date(),
+        key="sigen_battery_soc_date",
+    ).isoformat()
+    latest_soc = battery_soc.sort_values("period_end_local").iloc[-1]
+    latest_soc_time = pd.Timestamp(latest_soc["period_end_local"])
+    load_samples = energy_actuals[
+        energy_actuals["load_power_kw"].notna()
+        & (energy_actuals["period_end_local"] <= latest_soc_time)
+        & (energy_actuals["period_end_local"] > latest_soc_time - pd.Timedelta(days=7))
+    ].copy()
+    if not load_samples.empty:
+        load_samples["slot_end"] = load_samples["period_end_local"].dt.ceil("30min")
+        load_samples["slot"] = load_samples["slot_end"].dt.strftime("%H:%M")
+        load_profile = load_samples.groupby("slot")["load_power_kw"].mean()
+        average_load_kw = float(load_samples["load_power_kw"].mean())
+    else:
+        load_profile = pd.Series(dtype=float)
+        average_load_kw = 0.0
+    scenario_generation = pd.DataFrame(columns=["time_local", "solcast_kw", "openmeteo_kw"])
+    if not history.empty and not openmeteo_forecast_hourly.empty:
+        solcast_projection = history.dropna(subset=["pv_estimate"]).copy()
+        solcast_projection = (
+            solcast_projection.sort_values("downloaded_at_utc", ascending=False)
+            .drop_duplicates("period_end_utc", keep="first")
+        )
+        solcast_projection = solcast_projection[
+            solcast_projection["period_end_utc"] > latest_soc_time.tz_convert("UTC")
+        ][["period_end_local", "pv_estimate"]].rename(
+            columns={"period_end_local": "time_local", "pv_estimate": "solcast_kw"}
+        )
+        openmeteo_projection = openmeteo_forecast_hourly[
+            ["time_local", "openmeteo_power_kw"]
+        ].dropna().copy()
+        openmeteo_projection["time_local"] = pd.to_datetime(openmeteo_projection["time_local"])
+        openmeteo_projection["time_local"] = (
+            openmeteo_projection["time_local"].dt.floor("30min")
+            + pd.Timedelta(minutes=30)
+        )
+        openmeteo_projection = openmeteo_projection.groupby("time_local", as_index=False).agg(
+            openmeteo_kw=("openmeteo_power_kw", "mean"),
+        )
+        scenario_generation = solcast_projection.merge(
+            openmeteo_projection, on="time_local", how="inner",
+        ).sort_values("time_local")
+    scenario_current_date = pd.Timestamp.now(tz=TZ_NAME).date()
+    scenario_cols = st.columns([1, 1, 1, 1])
+    with scenario_cols[0]:
+        scenario_start_date = st.date_input(
+            "Sell from date", value=scenario_current_date,
+            key="battery_soc_scenario_start_date_v2",
+        )
+    with scenario_cols[1]:
+        scenario_start_time = st.time_input(
+            "Sell from time", value=dt_time(18, 0),
+            key="battery_soc_scenario_start_time_v2",
+        )
+    with scenario_cols[2]:
+        scenario_end_date = st.date_input(
+            "Sell until date", value=scenario_current_date,
+            key="battery_soc_scenario_end_date_v2",
+        )
+    with scenario_cols[3]:
+        scenario_end_time = st.time_input(
+            "Sell until time", value=dt_time(19, 0),
+            key="battery_soc_scenario_end_time_v2",
+        )
+    scenario_second_enabled = st.checkbox(
+        "Add a second sell period", key="battery_soc_scenario_second_enabled",
+    )
+    if scenario_second_enabled:
+        scenario_second_cols = st.columns([1, 1, 1, 1])
+        with scenario_second_cols[0]:
+            scenario_second_start_date = st.date_input(
+                "Second sell from date", value=scenario_current_date,
+                key="battery_soc_scenario_second_start_date",
+            )
+        with scenario_second_cols[1]:
+            scenario_second_start_time = st.time_input(
+                "Second sell from time", value=dt_time(20, 0),
+                key="battery_soc_scenario_second_start_time",
+            )
+        with scenario_second_cols[2]:
+            scenario_second_end_date = st.date_input(
+                "Second sell until date", value=scenario_current_date,
+                key="battery_soc_scenario_second_end_date",
+            )
+        with scenario_second_cols[3]:
+            scenario_second_end_time = st.time_input(
+                "Second sell until time", value=dt_time(21, 0),
+                key="battery_soc_scenario_second_end_time",
+            )
+    else:
+        scenario_second_start_date = st.session_state.get(
+            "battery_soc_scenario_second_start_date", scenario_current_date,
+        )
+        scenario_second_start_time = st.session_state.get(
+            "battery_soc_scenario_second_start_time", dt_time(20, 0),
+        )
+        scenario_second_end_date = st.session_state.get(
+            "battery_soc_scenario_second_end_date", scenario_current_date,
+        )
+        scenario_second_end_time = st.session_state.get(
+            "battery_soc_scenario_second_end_time", dt_time(21, 0),
+        )
+    scenario_start = pd.Timestamp(datetime.combine(
+        scenario_start_date, scenario_start_time,
+    )).tz_localize(TZ_NAME)
+    scenario_end = pd.Timestamp(datetime.combine(
+        scenario_end_date, scenario_end_time,
+    )).tz_localize(TZ_NAME)
+    scenario_periods = [(scenario_start, scenario_end)]
+    if scenario_second_enabled:
+        scenario_periods.append((
+            pd.Timestamp(datetime.combine(
+                scenario_second_start_date, scenario_second_start_time,
+            )).tz_localize(TZ_NAME),
+            pd.Timestamp(datetime.combine(
+                scenario_second_end_date, scenario_second_end_time,
+            )).tz_localize(TZ_NAME),
+        ))
+    scenario_periods = merge_time_windows(scenario_periods)
+    scenario_window_throughputs_kwh = [0.0] * len(scenario_periods)
+    if not load_samples.empty and not scenario_generation.empty and scenario_periods:
+        for generation_row in scenario_generation.itertuples(index=False):
+            interval_end = pd.Timestamp(generation_row.time_local)
+            interval_start = interval_end - pd.Timedelta(minutes=30)
+            typical_load_kw = float(
+                load_profile.get(interval_end.strftime("%H:%M"), average_load_kw)
+            )
+            solar_kw = min(
+                SIGEN_INVERTER_LIMIT_KW,
+                max(0.0, (float(generation_row.solcast_kw)
+                          + float(generation_row.openmeteo_kw)) / 2),
+            )
+            max_total_export_kw = min(
+                max(0.0, SIGEN_INVERTER_LIMIT_KW - typical_load_kw),
+                SIGEN_SITE_EXPORT_LIMIT_KW,
+            )
+            solar_export_kw = min(
+                max(0.0, solar_kw - typical_load_kw), max_total_export_kw,
+            )
+            remaining_export_kw = max(0.0, max_total_export_kw - solar_export_kw)
+            for period_index, (period_start, period_end) in enumerate(scenario_periods):
+                overlaps = overlapping_time_segments(
+                    interval_start, interval_end, [(period_start, period_end)],
+                )
+                period_hours = sum(
+                    (overlap_end - overlap_start).total_seconds() / 3600
+                    for overlap_start, overlap_end in overlaps
+                )
+                scenario_window_throughputs_kwh[period_index] += (
+                    remaining_export_kw * period_hours
+                )
+    scenario_inverter_throughput_kwh = sum(scenario_window_throughputs_kwh)
+    scenario_max_sell_kwh_by_window = [
+        min(SIGEN_BATTERY_CAPACITY_KWH, throughput)
+        for throughput in scenario_window_throughputs_kwh
+    ]
+    scenario_max_sell_pcts = [
+        min(100, int(np.floor(
+            max_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100 + 1e-9
+        )))
+        for max_kwh in scenario_max_sell_kwh_by_window
+    ]
+    scenario_sell_pcts = []
+    for window_index, max_pct in enumerate(scenario_max_sell_pcts):
+        input_cols = st.columns([2, 1])
+        with input_cols[0]:
+            raw_pct = st.text_input(
+                f"Sell target for period {window_index + 1} (%)",
+                value=st.session_state.get(
+                    f"battery_soc_scenario_sell_pct_{window_index + 1}",
+                    str(min(20, max_pct)),
+                ),
+                key=f"battery_soc_scenario_sell_pct_{window_index + 1}",
+                help="Percentage of the 24 kWh battery to target during this sell period.",
+            )
+        with input_cols[1]:
+            st.markdown(f"**Maximum: {max_pct}%**")
+        try:
+            sell_pct = float(raw_pct.strip())
+            if not np.isfinite(sell_pct):
+                raise ValueError
+        except (AttributeError, TypeError, ValueError):
+            sell_pct = 0.0
+            st.warning(f"Sell target for period {window_index + 1} must be a number; using 0%.")
+        if sell_pct < 0:
+            sell_pct = 0.0
+            st.warning(f"Sell target for period {window_index + 1} cannot be negative; using 0%.")
+        if sell_pct > max_pct:
+            sell_pct = float(max_pct)
+            st.warning(
+                f"Sell target for period {window_index + 1} exceeds its maximum; "
+                f"using {max_pct}%."
+            )
+        scenario_sell_pcts.append(sell_pct)
+    st.caption(
+        f"Estimated additional battery export capacity across the selected windows: "
+        f"{scenario_inverter_throughput_kwh:.1f} kWh. Per-window capacity: "
+        f"{', '.join(f'{value:.1f} kWh' for value in scenario_window_throughputs_kwh) or '—'}. "
+        f"Maximum target per window: "
+        f"{', '.join(f'{value:.1f} kWh ({pct}%)' for value, pct in zip(scenario_max_sell_kwh_by_window, scenario_max_sell_pcts)) or '—'}. "
+        f"Export limit assumed: "
+        f"{SIGEN_SITE_EXPORT_LIMIT_KW:.1f} kW. Set SIGEN_EXPORT_LIMIT_KW to your configured site limit."
+    )
+    battery_soc_intraday = battery_soc[
+        battery_soc["local_date"] == battery_soc_date
+    ].sort_values("period_end_local")
+    soc_fig = go.Figure()
+    soc_fig.add_trace(go.Scatter(
+        x=battery_soc_intraday["period_end_local"],
+        y=battery_soc_intraday["Battery state of charge (%)"],
+        mode="lines", name="Battery state of charge",
+        line=dict(width=2, color="#4c78a8"), connectgaps=False,
+        hovertemplate="%{x|%H:%M}<br>Battery SOC: %{y:.1f}%<extra></extra>",
+    ))
+    soc_day_start = pd.Timestamp(battery_soc_date).tz_localize(TZ_NAME)
+    projection_available = False
+    projection_caption = ""
+    now_local = pd.Timestamp.now(tz=TZ_NAME)
+    can_project_from_latest_soc = (
+        pd.Timedelta(0) <= now_local - latest_soc_time <= pd.Timedelta(hours=12)
+    )
+    projection_path = pd.DataFrame()
+    scenario_sale_revenue = 0.0
+    scenario_sold_kwh = 0.0
+    scenario_priced_kwh = 0.0
+    scenario_amber_price_lookup = pd.DataFrame()
+    if not amber_prices.empty:
+        scenario_amber_prices = amber_prices[
+            (amber_prices["channel_type"] == "feedIn")
+            & amber_prices["per_kwh"].notna()
+            & amber_prices["price_type"].str.lower().isin(
+                ("actualinterval", "currentinterval", "forecastinterval")
+            )
+        ].copy()
+        if not scenario_amber_prices.empty:
+            scenario_amber_prices["_start_local"] = pd.to_datetime(
+                scenario_amber_prices["start_time_local"]
+            )
+            scenario_amber_prices["_end_local"] = pd.to_datetime(
+                scenario_amber_prices["end_time_local"]
+            )
+            scenario_amber_prices["_priority"] = scenario_amber_prices[
+                "price_type"
+            ].str.lower().map({"actualinterval": 0, "currentinterval": 1, "forecastinterval": 2})
+            scenario_amber_prices["_duration_minutes"] = (
+                (scenario_amber_prices["_end_local"]
+                 - scenario_amber_prices["_start_local"]).dt.total_seconds() / 60
+            )
+            bucket_rows = []
+            for _, price_row in scenario_amber_prices.iterrows():
+                bucket_start = price_row["_start_local"].floor("5min")
+                while bucket_start < price_row["_end_local"]:
+                    bucket_rows.append({
+                        "bucket_start": bucket_start,
+                        "per_kwh": float(price_row["per_kwh"]),
+                        "priority": int(price_row["_priority"]),
+                        "duration_minutes": float(price_row["_duration_minutes"]),
+                        "fetched_at_utc": price_row["fetched_at_utc"],
+                    })
+                    bucket_start += pd.Timedelta(minutes=5)
+            if bucket_rows:
+                scenario_amber_price_lookup = (
+                    pd.DataFrame(bucket_rows)
+                    .sort_values(
+                        ["priority", "duration_minutes", "fetched_at_utc"],
+                        ascending=[True, True, False],
+                    )
+                    .drop_duplicates("bucket_start", keep="first")
+                    .set_index("bucket_start")
+                )
+    if (can_project_from_latest_soc and not load_samples.empty
+            and not openmeteo_forecast_hourly.empty and not history.empty):
+        paired_generation = scenario_generation.copy()
+        if not paired_generation.empty:
+            current_soc = float(latest_soc["Battery state of charge (%)"])
+            low_soc = current_soc
+            high_soc = current_soc
+            midpoint_soc = current_soc
+            low_values, high_values, midpoint_values = [], [], []
+            for forecast_row in paired_generation.itertuples(index=False):
+                slot = forecast_row.time_local.strftime("%H:%M")
+                load_kw = float(load_profile.get(slot, average_load_kw))
+                load_kwh = load_kw * 0.5
+                solar_values = [max(0.0, float(forecast_row.solcast_kw)),
+                                max(0.0, float(forecast_row.openmeteo_kw))]
+
+                def advance_soc(soc, solar_kw):
+                    net_battery_kwh = solar_kw * 0.5 - load_kwh
+                    stored_kwh = net_battery_kwh * 0.95 if net_battery_kwh >= 0 else net_battery_kwh / 0.95
+                    return float(np.clip(
+                        soc + stored_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100, 0, 100,
+                    ))
+
+                low_soc = advance_soc(low_soc, min(solar_values))
+                high_soc = advance_soc(high_soc, max(solar_values))
+                midpoint_soc = advance_soc(midpoint_soc, sum(solar_values) / 2)
+                low_values.append(low_soc)
+                high_values.append(high_soc)
+                midpoint_values.append(midpoint_soc)
+
+            projection_times = paired_generation["time_local"]
+            projection_times = pd.DatetimeIndex([latest_soc_time]).append(
+                pd.DatetimeIndex(projection_times)
+            )
+            low_values = [current_soc, *low_values]
+            high_values = [current_soc, *high_values]
+            midpoint_values = [current_soc, *midpoint_values]
+            projection_path = pd.DataFrame({
+                "time_local": projection_times,
+                "soc_low": low_values,
+                "soc_high": high_values,
+                "soc_midpoint": midpoint_values,
+            })
+            if any(sell_pct > 0 for sell_pct in scenario_sell_pcts) and scenario_periods:
+                target_sale_kwh_by_window = [
+                    SIGEN_BATTERY_CAPACITY_KWH * sell_pct / 100
+                    for sell_pct in scenario_sell_pcts
+                ]
+                window_sold_kwh = [0.0] * len(scenario_periods)
+                scenario_soc = current_soc
+                scenario_values = [scenario_soc]
+                for forecast_row in paired_generation.itertuples(index=False):
+                    forecast_time = pd.Timestamp(forecast_row.time_local)
+                    slot = forecast_time.strftime("%H:%M")
+                    typical_load_kw = float(load_profile.get(slot, average_load_kw))
+                    solar_kw = min(
+                        SIGEN_INVERTER_LIMIT_KW,
+                        max(0.0, (float(forecast_row.solcast_kw)
+                                  + float(forecast_row.openmeteo_kw)) / 2),
+                    )
+                    interval_start = forecast_time - pd.Timedelta(minutes=30)
+                    sale_segments = []
+                    if forecast_time > latest_soc_time:
+                        for period_index, (period_start, period_end) in enumerate(scenario_periods):
+                            sale_start = max(interval_start, period_start)
+                            sale_end = min(forecast_time, period_end)
+                            if sale_start < sale_end:
+                                sale_segments.append((period_index, sale_start, sale_end))
+                    sale_hours = sum(
+                        (sale_end - sale_start).total_seconds() / 3600
+                        for _, sale_start, sale_end in sale_segments
+                    )
+                    sale_period_active = sale_hours > 0
+                    battery_export_headroom_kw = 0.0
+                    if sale_period_active:
+                        max_total_export_kw = min(
+                            max(0.0, SIGEN_INVERTER_LIMIT_KW - typical_load_kw),
+                            SIGEN_SITE_EXPORT_LIMIT_KW,
+                        )
+                        solar_export_kw = min(
+                            max(0.0, solar_kw - typical_load_kw),
+                            max_total_export_kw,
+                        )
+                        battery_export_headroom_kw = max(
+                            0.0, max_total_export_kw - solar_export_kw,
+                        )
+                        net_battery_kwh = (
+                            (solar_kw - typical_load_kw)
+                            * (0.5 - sale_hours)
+                            + (solar_kw - typical_load_kw - solar_export_kw)
+                            * sale_hours
+                        )
+                    else:
+                        net_battery_kwh = (solar_kw - typical_load_kw) * 0.5
+                    if net_battery_kwh >= 0:
+                        scenario_soc += (
+                            net_battery_kwh * 0.95
+                            / SIGEN_BATTERY_CAPACITY_KWH * 100
+                        )
+                    else:
+                        scenario_soc += (
+                            net_battery_kwh / 0.95
+                            / SIGEN_BATTERY_CAPACITY_KWH * 100
+                        )
+                    scenario_soc = float(np.clip(scenario_soc, 0, 100))
+                    forecast_time = pd.Timestamp(forecast_time)
+                    if sale_period_active:
+                        for period_index, sale_start, sale_end in sale_segments:
+                            segment_hours = (sale_end - sale_start).total_seconds() / 3600
+                            available_ac_energy_kwh = (
+                                scenario_soc / 100
+                                * SIGEN_BATTERY_CAPACITY_KWH * 0.95
+                            )
+                            segment_sale_kwh = max(0.0, min(
+                                battery_export_headroom_kw * segment_hours,
+                                target_sale_kwh_by_window[period_index]
+                                - window_sold_kwh[period_index],
+                                available_ac_energy_kwh,
+                            ))
+                            window_sold_kwh[period_index] += segment_sale_kwh
+                            scenario_sold_kwh += segment_sale_kwh
+                            scenario_soc = max(
+                                0.0,
+                                scenario_soc - segment_sale_kwh / (
+                                    SIGEN_BATTERY_CAPACITY_KWH * 0.95
+                                ) * 100,
+                            )
+                            if segment_sale_kwh > 0 and not scenario_amber_price_lookup.empty:
+                                price_values = []
+                                price_weights = []
+                                price_start = sale_start.floor("5min")
+                                while price_start < sale_end:
+                                    bucket_end = price_start + pd.Timedelta(minutes=5)
+                                    overlap_start = max(price_start, sale_start)
+                                    overlap_end = min(bucket_end, sale_end)
+                                    overlap_minutes = max(
+                                        0.0,
+                                        (overlap_end - overlap_start).total_seconds() / 60,
+                                    )
+                                    try:
+                                        bucket_price = scenario_amber_price_lookup.loc[
+                                            price_start, "per_kwh"
+                                        ]
+                                        if isinstance(bucket_price, pd.Series):
+                                            bucket_price = bucket_price.iloc[0]
+                                    except KeyError:
+                                        bucket_price = None
+                                    if bucket_price is not None and overlap_minutes > 0:
+                                        price_values.append(float(bucket_price))
+                                        price_weights.append(overlap_minutes)
+                                    price_start = bucket_end
+                                if price_weights:
+                                    average_price_cents = float(np.average(
+                                        price_values, weights=price_weights,
+                                    ))
+                                    priced_fraction = min(
+                                        1.0,
+                                        sum(price_weights) / max(segment_hours * 60, 1e-9),
+                                    )
+                                    priced_sale_kwh = segment_sale_kwh * priced_fraction
+                                    scenario_sale_revenue += (
+                                        priced_sale_kwh * average_price_cents / 100
+                                    )
+                                    scenario_priced_kwh += priced_sale_kwh
+                    scenario_values.append(scenario_soc)
+                projection_path["soc_scenario"] = scenario_values
+            projection_available = True
+            projection_caption = (
+                f"Dashed forecast band uses Solcast and Open-Meteo production estimates, "
+                f"with time-of-day average Sigen load (overall mean {average_load_kw:.2f} kW) "
+                "from the previous seven days. "
+                f"It assumes {SIGEN_BATTERY_CAPACITY_KWH:.0f} kWh usable capacity, 95% charge/discharge efficiency, "
+                "and does not model grid charging, export, or curtailment."
+            )
+    if not projection_caption:
+        projection_caption = (
+            "Forecast range needs a recent Sigen SOC reading, both forecast providers, "
+            "and recent Sigen load readings."
+        )
+    if projection_available:
+        day_end = soc_day_start + pd.DateOffset(days=1)
+        prior_state = projection_path[
+            projection_path["time_local"] <= soc_day_start
+        ].tail(1)
+        day_states = projection_path[
+            (projection_path["time_local"] > soc_day_start)
+            & (projection_path["time_local"] <= day_end)
+        ]
+        if not prior_state.empty:
+            prior_day_state = {
+                "time_local": [soc_day_start],
+                "soc_low": [prior_state.iloc[0]["soc_low"]],
+                "soc_high": [prior_state.iloc[0]["soc_high"]],
+                "soc_midpoint": [prior_state.iloc[0]["soc_midpoint"]],
+            }
+            if "soc_scenario" in projection_path:
+                prior_day_state["soc_scenario"] = [
+                    prior_state.iloc[0]["soc_scenario"]
+                ]
+            day_states = pd.concat([
+                pd.DataFrame(prior_day_state),
+                day_states,
+            ], ignore_index=True)
+        if not day_states.empty:
+            soc_fig.add_trace(go.Scatter(
+                x=day_states["time_local"], y=day_states["soc_low"],
+                mode="lines", name="Forecast range low",
+                line=dict(width=1, color="rgba(123,97,168,0.65)", dash="dot"),
+                hovertemplate="%{x|%H:%M}<br>Lower SOC: %{y:.1f}%<extra></extra>",
+            ))
+            soc_fig.add_trace(go.Scatter(
+                x=day_states["time_local"], y=day_states["soc_high"],
+                mode="lines", name="Forecast range high",
+                line=dict(width=1, color="rgba(123,97,168,0.65)", dash="dot"),
+                fill="tonexty", fillcolor="rgba(123,97,168,0.14)",
+                hovertemplate="%{x|%H:%M}<br>Upper SOC: %{y:.1f}%<extra></extra>",
+            ))
+            soc_fig.add_trace(go.Scatter(
+                x=day_states["time_local"], y=day_states["soc_midpoint"],
+                mode="lines", name="Forecast SOC midpoint",
+                line=dict(width=2, color="#7b61a8", dash="dot"),
+                hovertemplate="%{x|%H:%M}<br>Forecast SOC: %{y:.1f}%<extra></extra>",
+            ))
+            if "soc_scenario" in day_states:
+                soc_fig.add_trace(go.Scatter(
+                    x=day_states["time_local"], y=day_states["soc_scenario"],
+                    mode="lines", name="SOC scenario with battery sales",
+                    line=dict(width=2, color="#d62728", dash="dash"),
+                    hovertemplate="%{x|%H:%M}<br>Scenario SOC: %{y:.1f}%<extra></extra>",
+                ))
+    soc_fig.update_layout(
+        xaxis_title="Time (Sydney)", yaxis_title="Battery state of charge (%)",
+        margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+    )
+    soc_fig.update_yaxes(range=[0, 100], ticksuffix="%")
+    soc_fig.update_xaxes(
+        range=[soc_day_start, soc_day_start + pd.DateOffset(days=1)], fixedrange=True,
+    )
+    place_legend_below_chart(soc_fig)
+    st.plotly_chart(soc_fig, width="stretch")
+    st.caption("Battery SOC is read from the battery_soc column in sigen_energy_actuals. " + projection_caption)
+    if any(sell_pct > 0 for sell_pct in scenario_sell_pcts):
+        if not scenario_periods:
+            st.caption("Choose valid sell start and end dates and times to show the sales scenario.")
+        else:
+            scenario_window_labels = "; ".join(
+                f"{window_start.strftime('%d %b %Y %H:%M')}–{window_end.strftime('%d %b %Y %H:%M')}"
+                for window_start, window_end in scenario_periods
+            )
+            scenario_target_labels = "; ".join(
+                f"period {index + 1}: {sell_pct:g}% "
+                f"({SIGEN_BATTERY_CAPACITY_KWH * sell_pct / 100:.1f} kWh AC)"
+                for index, sell_pct in enumerate(scenario_sell_pcts)
+            )
+            st.caption(
+                f"Sales scenario targets {scenario_target_labels} "
+                f"during {scenario_window_labels} Sydney time. "
+                "Export is capped each 30-minute period by inverter and site export headroom after typical load and solar export; "
+                "the scenario line appears when a forecast SOC path is available."
+            )
+            sale_value_label = (
+                f"-${abs(scenario_sale_revenue):,.2f}"
+                if scenario_sale_revenue < 0
+                else f"${scenario_sale_revenue:,.2f}"
+            ) if scenario_priced_kwh > 0 else "—"
+            priced_coverage = (
+                scenario_priced_kwh / scenario_sold_kwh * 100
+                if scenario_sold_kwh > 0 else 0.0
+            )
+            sale_metric_cols = st.columns(3)
+            sale_metric_cols[0].metric(
+                "Predicted Amber sale value", sale_value_label,
+                help="Estimated revenue from simulated battery export, using Amber feed-in prices for matching intervals.",
+            )
+            sale_metric_cols[1].metric("Scenario energy sold", f"{scenario_sold_kwh:.2f} kWh")
+            sale_metric_cols[2].metric("Energy with Amber prices", f"{priced_coverage:.0f}%")
+            st.caption(
+                "Sale value is an estimate using Amber feed-in prices (actual/current prices where available, "
+                "otherwise forecast prices). Unpriced intervals are excluded from the value."
+            )
+
 if history.empty:
     st.info("No forecast data saved yet. Configure SOLCAST_API_KEY and choose **Download latest forecast**.")
     st.markdown("""
@@ -1090,31 +1871,6 @@ if history.empty:
     """)
     st.stop()
 
-# Latest complete API download is one snapshot.
-latest_stamp = history["downloaded_at_utc"].max()
-latest = history[history["downloaded_at_utc"] == latest_stamp].copy()
-latest = latest.sort_values("period_end_local")
-actuals = load_latest_actuals()
-openmeteo_hourly = load_openmeteo_hourly()
-openmeteo_forecast_hourly = load_openmeteo_forecast_hourly()
-openmeteo_forecast_snapshots = load_openmeteo_forecast_snapshots()
-openmeteo_historical_forecast_hourly = load_openmeteo_historical_forecast_hourly()
-openmeteo_performance_ratio, performance_ratio_samples, performance_ratio_days = (
-    calibrate_openmeteo_performance_ratio(openmeteo_hourly, power_actuals)
-)
-openmeteo_hourly = apply_openmeteo_performance_ratio(
-    openmeteo_hourly, openmeteo_performance_ratio,
-)
-openmeteo_forecast_hourly = apply_openmeteo_performance_ratio(
-    openmeteo_forecast_hourly, openmeteo_performance_ratio,
-)
-openmeteo_forecast_snapshots = apply_openmeteo_performance_ratio(
-    openmeteo_forecast_snapshots, openmeteo_performance_ratio,
-)
-openmeteo_historical_forecast_hourly = apply_openmeteo_performance_ratio(
-    openmeteo_historical_forecast_hourly, openmeteo_performance_ratio,
-)
-openmeteo_daily = load_openmeteo_daily()
 daily = daily_summary(latest)
 if not actuals.empty:
     actuals_daily = actuals.groupby("local_date", as_index=False).agg(
@@ -1260,26 +2016,6 @@ fig.update_layout(xaxis_title="Date (Sydney)", yaxis_title="Energy (kWh)",
 place_legend_below_chart(fig)
 st.plotly_chart(fig, width="stretch")
 
-st.subheader("Non-zero production hours vs daylight duration covered")
-st.caption("For incomplete dates, the daylight bar and Sigen production hours use only recorded five-minute intervals that overlap sunrise-to-sunset.")
-sunshine_fig = go.Figure()
-sunshine_fig.add_trace(go.Bar(
-    x=daily["local_date"], y=daily["Sigen_nonzero_hours"],
-    name="Sigen production above 0 kW (hours)",
-    hovertemplate="%{x}<br>Sigen production above 0 kW: %{y:.2f} h<extra></extra>",
-))
-sunshine_fig.add_trace(go.Bar(
-    x=daily["local_date"], y=daily["daylight_hours_comparison"],
-    name="Open-Meteo daylight within Sigen data coverage (hours)",
-    hovertemplate="%{x}<br>Open-Meteo daylight within Sigen data coverage: %{y:.2f} h<extra></extra>",
-))
-sunshine_fig.update_layout(
-    barmode="group", xaxis_title="Date (Sydney)", yaxis_title="Hours",
-    margin=dict(l=10, r=10, t=20, b=10), xaxis_tickangle=-35,
-)
-place_legend_below_chart(sunshine_fig)
-st.plotly_chart(sunshine_fig, width="stretch")
-
 st.subheader("Solcast Forecast and actual power by time")
 available_dates = sorted(set(latest["local_date"])
                          .union(actuals["local_date"] if not actuals.empty else [])
@@ -1307,6 +2043,77 @@ def generated_date_label(timestamps):
     if parsed.empty:
         return None
     return parsed.max().tz_convert(TZ_NAME).strftime("%d %b %Y")
+
+def power_accuracy_metrics(label, predictions, time_col, power_col, meter_power,
+                           interval_hours, issue_time_col=None):
+    """Score forecast power against interpolated Sigen samples at the same times."""
+    if predictions.empty or meter_power.empty:
+        return None
+    frame = predictions[[time_col, power_col] + ([issue_time_col] if issue_time_col else [])].copy()
+    frame["valid_time_utc"] = pd.to_datetime(frame[time_col], utc=True, errors="coerce")
+    frame["forecast_kw"] = pd.to_numeric(frame[power_col], errors="coerce")
+    frame = frame.dropna(subset=["valid_time_utc", "forecast_kw"])
+    actual = meter_power[["period_end_local", "Solar Production (kW)"]].copy()
+    actual["valid_time_utc"] = pd.to_datetime(actual["period_end_local"], utc=True, errors="coerce")
+    actual["actual_kw"] = pd.to_numeric(actual["Solar Production (kW)"], errors="coerce")
+    actual = actual.dropna(subset=["valid_time_utc", "actual_kw"])
+    if frame.empty or actual.empty:
+        return None
+    actual_series = actual.drop_duplicates("valid_time_utc", keep="last").set_index("valid_time_utc")["actual_kw"].sort_index()
+    requested_times = pd.DatetimeIndex(frame["valid_time_utc"].drop_duplicates()).sort_values()
+    aligned_times = actual_series.index.union(requested_times).sort_values()
+    aligned_actual = (
+        actual_series.reindex(aligned_times)
+        .interpolate(method="time", limit_area="inside")
+        .reindex(requested_times)
+    )
+    frame["actual_kw"] = frame["valid_time_utc"].map(aligned_actual)
+    frame = frame.dropna(subset=["actual_kw"])
+    if frame.empty:
+        return None
+    error = frame["forecast_kw"] - frame["actual_kw"]
+    if interval_hours is None:
+        sample_times = pd.DatetimeIndex(frame["valid_time_utc"].drop_duplicates()).sort_values()
+        interval_hours = sample_times.to_series().diff().dt.total_seconds().median() / 3600
+    if pd.isna(interval_hours) or interval_hours <= 0:
+        return None
+    forecast_energy = frame["forecast_kw"].sum() * interval_hours
+    actual_energy = frame["actual_kw"].sum() * interval_hours
+    energy_error_pct = (
+        (forecast_energy - actual_energy) / actual_energy * 100
+        if actual_energy > 0 else float("nan")
+    )
+    return {
+        "Series": label,
+        "Matched periods": len(frame),
+        "MAE (kW)": error.abs().mean(),
+        "RMSE (kW)": (error.pow(2).mean()) ** 0.5,
+        "Bias (kW)": error.mean(),
+        "Energy error (%)": energy_error_pct,
+        "Forecast energy (kWh)": forecast_energy,
+        "Sigen energy (kWh)": actual_energy,
+    }
+
+def forecast_lead_time_scores(forecasts, time_col, power_col, meter_power, interval_hours):
+    """Calculate error metrics by how far ahead each saved forecast was issued."""
+    if forecasts.empty or "fetched_at_utc" not in forecasts or meter_power.empty:
+        return pd.DataFrame()
+    frame = forecasts.copy()
+    frame["valid_time_utc"] = pd.to_datetime(frame[time_col], utc=True, errors="coerce")
+    frame["fetched_at_utc"] = pd.to_datetime(frame["fetched_at_utc"], utc=True, errors="coerce")
+    frame["lead_hours"] = (frame["valid_time_utc"] - frame["fetched_at_utc"]).dt.total_seconds() / 3600
+    bins = [0, 24, 48, 72, 168]
+    labels = ["0–24 hours", "1–2 days", "2–3 days", "3–7 days"]
+    frame["Lead time"] = pd.cut(frame["lead_hours"], bins=bins, labels=labels, right=True)
+    rows = []
+    for lead_label in labels:
+        group = frame[frame["Lead time"] == lead_label]
+        score = power_accuracy_metrics(
+            lead_label, group, time_col, power_col, meter_power, interval_hours,
+        )
+        if score:
+            rows.append(score)
+    return pd.DataFrame(rows)
 
 def intervals_cover_full_local_day(period_end_utc, period_hours, local_date):
     """Return true only when intervals continuously cover the whole local day."""
@@ -1519,6 +2326,35 @@ fig2.update_xaxes(
 )
 place_legend_below_chart(fig2)
 st.plotly_chart(fig2, width="stretch")
+
+st.markdown("**Solcast accuracy against Sigen actuals**")
+solcast_accuracy_rows = []
+score = power_accuracy_metrics(
+    "Solcast forecast", solcast_chart_forecast, "period_end_utc", "pv_estimate",
+    meter_power_intraday, 0.5,
+)
+if score:
+    solcast_accuracy_rows.append(score)
+score = power_accuracy_metrics(
+    "Solcast estimated actual", actual_intraday, "period_end_utc", "pv_estimate",
+    meter_power_intraday, 0.5,
+)
+if score:
+    solcast_accuracy_rows.append(score)
+if solcast_accuracy_rows:
+    st.dataframe(pd.DataFrame(solcast_accuracy_rows), width="stretch", hide_index=True)
+    st.caption("MAE and RMSE show typical point error; positive bias and energy error mean over-prediction. Scores use matched timestamps only.")
+else:
+    st.caption("Accuracy scores appear when Sigen actuals overlap the selected Solcast date.")
+
+solcast_lead_rows = history[history["local_date"] == chosen_date]
+solcast_lead_scores = forecast_lead_time_scores(
+    solcast_lead_rows, "period_end_utc", "pv_estimate", meter_power_intraday, 0.5,
+)
+if not solcast_lead_scores.empty:
+    with st.expander("Solcast forecast accuracy by lead time"):
+        st.dataframe(solcast_lead_scores, width="stretch", hide_index=True)
+        st.caption("Each saved forecast interval is scored at its original issue time, grouped by time until the interval ends.")
 
 st.subheader("Open-Meteo estimated and actual power by time")
 if performance_ratio_samples >= 50 and performance_ratio_days == 1:
@@ -1810,6 +2646,46 @@ fig3.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
 place_legend_below_chart(fig3)
 st.plotly_chart(fig3, width="stretch")
 
+st.markdown("**Open-Meteo accuracy against Sigen actuals**")
+openmeteo_accuracy_rows = []
+score = power_accuracy_metrics(
+    "Open-Meteo satellite estimate", openmeteo_intraday, "time_local", "openmeteo_power_kw",
+    meter_openmeteo_intraday, None,
+)
+if score:
+    openmeteo_accuracy_rows.append(score)
+if not openmeteo_historical_forecast_intraday.empty:
+    score = power_accuracy_metrics(
+        "Open-Meteo historical forecast", openmeteo_historical_forecast_intraday,
+        "time_local", "openmeteo_power_kw", meter_openmeteo_intraday, None,
+    )
+    if score:
+        openmeteo_accuracy_rows.append(score)
+if (not openmeteo_forecast_intraday.empty
+        and (openmeteo_chosen_date >= today or openmeteo_historical_forecast_intraday.empty)):
+    score = power_accuracy_metrics(
+        "Open-Meteo weather forecast", openmeteo_forecast_intraday,
+        "time_local", "openmeteo_power_kw", meter_openmeteo_intraday, 0.25,
+    )
+    if score:
+        openmeteo_accuracy_rows.append(score)
+if openmeteo_accuracy_rows:
+    st.dataframe(pd.DataFrame(openmeteo_accuracy_rows), width="stretch", hide_index=True)
+    st.caption("MAE and RMSE show typical point error; positive bias and energy error mean over-prediction. Scores use matched timestamps only.")
+else:
+    st.caption("Accuracy scores appear when Sigen actuals overlap the selected Open-Meteo date.")
+
+openmeteo_lead_rows = openmeteo_forecast_snapshots[
+    openmeteo_forecast_snapshots["local_date"] == openmeteo_chosen_date
+] if not openmeteo_forecast_snapshots.empty else pd.DataFrame()
+openmeteo_lead_scores = forecast_lead_time_scores(
+    openmeteo_lead_rows, "time_utc", "openmeteo_power_kw", meter_openmeteo_intraday, 0.25,
+)
+if not openmeteo_lead_scores.empty:
+    with st.expander("Open-Meteo forecast accuracy by lead time"):
+        st.dataframe(openmeteo_lead_scores, width="stretch", hide_index=True)
+        st.caption("Each saved 15-minute forecast interval is scored at its original issue time, grouped by time until the interval starts.")
+
 st.subheader("Open-Meteo forecast revisions")
 if openmeteo_forecast_snapshots.empty:
     st.info("Forecast revision history starts after the next Open-Meteo refresh.")
@@ -1823,12 +2699,12 @@ else:
         )
     else:
         revision_default = today if today in revision_dates else revision_dates[-1]
-        revision_date = st.selectbox(
-            "Forecast date with multiple saved runs", revision_dates,
-            index=revision_dates.index(revision_default),
-            format_func=lambda value: pd.Timestamp(value).strftime("%d %b %Y"),
+        revision_date = half_width_date_picker_with_arrows(
+            "Open-Meteo forecast revision date", pd.Timestamp(revision_default).date(),
+            min_value=pd.Timestamp(revision_dates[0]).date(),
+            max_value=pd.Timestamp(revision_dates[-1]).date(),
             key="openmeteo_revision_date",
-        )
+        ).isoformat()
         revision_day_rows = openmeteo_forecast_snapshots[
             openmeteo_forecast_snapshots["local_date"] == revision_date
         ].copy()
@@ -1872,6 +2748,87 @@ else:
         )
         place_legend_below_chart(revision_fig)
         st.plotly_chart(revision_fig, width="stretch")
+
+st.subheader("Solcast forecast revisions")
+if history.empty:
+    st.info("Solcast forecast revision history starts after the next forecast download.")
+else:
+    solcast_revision_counts = history.groupby("local_date")["downloaded_at_utc"].nunique()
+    solcast_revision_dates = sorted(
+        solcast_revision_counts[solcast_revision_counts >= 2].index
+    )
+    if not solcast_revision_dates:
+        solcast_snapshot_count = history["downloaded_at_utc"].nunique()
+        st.info(
+            f"Saved {solcast_snapshot_count} Solcast forecast run. "
+            "Refresh again to compare revisions for a day."
+        )
+    else:
+        solcast_revision_default = (
+            today if today in solcast_revision_dates else solcast_revision_dates[-1]
+        )
+        solcast_revision_date = half_width_date_picker_with_arrows(
+            "Solcast forecast revision date", pd.Timestamp(solcast_revision_default).date(),
+            min_value=pd.Timestamp(solcast_revision_dates[0]).date(),
+            max_value=pd.Timestamp(solcast_revision_dates[-1]).date(),
+            key="solcast_revision_date",
+        ).isoformat()
+        solcast_revision_rows = history[
+            history["local_date"] == solcast_revision_date
+        ].copy()
+        solcast_run_stamps = sorted(
+            solcast_revision_rows["downloaded_at_utc"].dropna().unique()
+        )
+        solcast_total_revision_count = len(solcast_run_stamps)
+        if solcast_total_revision_count > 10:
+            solcast_run_stamps = solcast_run_stamps[-10:]
+            st.caption(
+                f"Showing the 10 most recent of {solcast_total_revision_count} "
+                "saved Solcast forecasts for this day."
+            )
+        else:
+            st.caption(
+                f"Comparing {solcast_total_revision_count} saved Solcast forecasts "
+                "for this day; each line is labeled by fetch time."
+            )
+        solcast_revision_fig = go.Figure()
+        for run_index, run_stamp in enumerate(solcast_run_stamps):
+            run_rows = solcast_revision_rows[
+                solcast_revision_rows["downloaded_at_utc"] == run_stamp
+            ].sort_values("period_end_local")
+            run_local_time = pd.to_datetime(run_stamp, utc=True).tz_convert(TZ_NAME)
+            is_latest = run_index == len(solcast_run_stamps) - 1
+            solcast_revision_fig.add_trace(go.Scatter(
+                x=run_rows["period_end_local"], y=run_rows["pv_estimate"],
+                mode="lines",
+                name=f"Fetched {run_local_time.strftime('%d %b %H:%M')}",
+                line=dict(
+                    color=px.colors.qualitative.Plotly[
+                        run_index % len(px.colors.qualitative.Plotly)
+                    ],
+                    width=2.5 if is_latest else 1.5,
+                    dash="solid" if is_latest else "dash",
+                ),
+                customdata=run_rows["pv_estimate10"],
+                hovertemplate=(
+                    "%{x|%H:%M}<br>Forecast: %{y:.2f} kW"
+                    "<br>P10: %{customdata:.2f} kW<extra>%{fullData.name}</extra>"
+                ),
+            ))
+        solcast_revision_day_start = pd.Timestamp(
+            solcast_revision_date
+        ).tz_localize(TZ_NAME)
+        solcast_revision_fig.update_layout(
+            xaxis_title="Time (Sydney)", yaxis_title="Forecast power (kW)",
+            margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+        )
+        solcast_revision_fig.update_xaxes(
+            range=[solcast_revision_day_start,
+                   solcast_revision_day_start + pd.DateOffset(days=1)],
+            fixedrange=True,
+        )
+        place_legend_below_chart(solcast_revision_fig)
+        st.plotly_chart(solcast_revision_fig, width="stretch")
 
 st.subheader("Solcast vs Open-Meteo forecast power")
 st.caption("Both forecasts are shown in kW for the same Sydney date. Missing Solcast points are filled from the newest earlier saved forecast that has that timestamp.")
@@ -1955,3 +2912,23 @@ with st.expander("View daily totals and export data"):
     st.download_button("Download all stored snapshots (CSV)",
                        history.to_csv(index=False).encode("utf-8"),
                        file_name="solcast_forecast_history.csv", mime="text/csv")
+
+st.subheader("Non-zero production hours vs daylight duration covered")
+st.caption("For incomplete dates, the daylight bar and Sigen production hours use only recorded five-minute intervals that overlap sunrise-to-sunset.")
+sunshine_fig = go.Figure()
+sunshine_fig.add_trace(go.Bar(
+    x=daily["local_date"], y=daily["Sigen_nonzero_hours"],
+    name="Sigen production above 0 kW (hours)",
+    hovertemplate="%{x}<br>Sigen production above 0 kW: %{y:.2f} h<extra></extra>",
+))
+sunshine_fig.add_trace(go.Bar(
+    x=daily["local_date"], y=daily["daylight_hours_comparison"],
+    name="Open-Meteo daylight within Sigen data coverage (hours)",
+    hovertemplate="%{x}<br>Open-Meteo daylight within Sigen data coverage: %{y:.2f} h<extra></extra>",
+))
+sunshine_fig.update_layout(
+    barmode="group", xaxis_title="Date (Sydney)", yaxis_title="Hours",
+    margin=dict(l=10, r=10, t=20, b=10), xaxis_tickangle=-35,
+)
+place_legend_below_chart(sunshine_fig)
+st.plotly_chart(sunshine_fig, width="stretch")
