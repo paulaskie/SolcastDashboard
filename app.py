@@ -1374,6 +1374,7 @@ else:
             "Sell until time", value=dt_time(19, 0),
             key="battery_soc_scenario_end_time_v2",
         )
+    scenario_target_placeholders = {0: st.empty()}
     scenario_second_enabled = st.checkbox(
         "Add a second sell period", key="battery_soc_scenario_second_enabled",
     )
@@ -1399,6 +1400,7 @@ else:
                 "Second sell until time", value=dt_time(21, 0),
                 key="battery_soc_scenario_second_end_time",
             )
+        scenario_target_placeholders[1] = st.empty()
     else:
         scenario_second_start_date = st.session_state.get(
             "battery_soc_scenario_second_start_date", scenario_current_date,
@@ -1418,9 +1420,10 @@ else:
     scenario_end = pd.Timestamp(datetime.combine(
         scenario_end_date, scenario_end_time,
     )).tz_localize(TZ_NAME)
-    scenario_periods = [(scenario_start, scenario_end)]
+    scenario_period_slots = [(0, scenario_start, scenario_end)]
     if scenario_second_enabled:
-        scenario_periods.append((
+        scenario_period_slots.append((
+            1,
             pd.Timestamp(datetime.combine(
                 scenario_second_start_date, scenario_second_start_time,
             )).tz_localize(TZ_NAME),
@@ -1428,9 +1431,12 @@ else:
                 scenario_second_end_date, scenario_second_end_time,
             )).tz_localize(TZ_NAME),
         ))
-    scenario_periods = merge_time_windows(scenario_periods)
-    scenario_window_throughputs_kwh = [0.0] * len(scenario_periods)
-    if not load_samples.empty and not scenario_generation.empty and scenario_periods:
+    scenario_periods = merge_time_windows([
+        (period_start, period_end)
+        for _, period_start, period_end in scenario_period_slots
+    ])
+    scenario_window_throughputs_kwh = [0.0] * len(scenario_period_slots)
+    if not load_samples.empty and not scenario_generation.empty and scenario_period_slots:
         for generation_row in scenario_generation.itertuples(index=False):
             interval_end = pd.Timestamp(generation_row.time_local)
             interval_start = interval_end - pd.Timedelta(minutes=30)
@@ -1450,7 +1456,9 @@ else:
                 max(0.0, solar_kw - typical_load_kw), max_total_export_kw,
             )
             remaining_export_kw = max(0.0, max_total_export_kw - solar_export_kw)
-            for period_index, (period_start, period_end) in enumerate(scenario_periods):
+            for period_index, period_start, period_end in scenario_period_slots:
+                if period_start >= period_end:
+                    continue
                 overlaps = overlapping_time_segments(
                     interval_start, interval_end, [(period_start, period_end)],
                 )
@@ -1462,31 +1470,177 @@ else:
                     remaining_export_kw * period_hours
                 )
     scenario_inverter_throughput_kwh = sum(scenario_window_throughputs_kwh)
-    scenario_max_sell_kwh_by_window = [
+    scenario_inverter_max_sell_kwh_by_window = [
         min(SIGEN_BATTERY_CAPACITY_KWH, throughput)
         for throughput in scenario_window_throughputs_kwh
     ]
+    scenario_inverter_max_sell_pcts = [
+        min(100, int(np.floor(
+            max_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100 + 1e-9
+        )))
+        for max_kwh in scenario_inverter_max_sell_kwh_by_window
+    ]
+    scenario_soc_start_by_window = [None] * len(scenario_period_slots)
+    if (not scenario_generation.empty and not battery_soc.empty
+            and pd.Timedelta(0) <= pd.Timestamp.now(tz=TZ_NAME) - latest_soc_time
+            <= pd.Timedelta(hours=12)):
+        preview_target_kwh = []
+        for period_index, _, _ in scenario_period_slots:
+            preview_key = f"battery_soc_scenario_sell_pct_{period_index + 1}"
+            try:
+                preview_pct = float(st.session_state.get(
+                    preview_key,
+                    min(20, scenario_inverter_max_sell_pcts[period_index]),
+                ))
+            except (TypeError, ValueError):
+                preview_pct = 0.0
+            preview_pct = float(np.clip(
+                preview_pct, 0, scenario_inverter_max_sell_pcts[period_index],
+            ))
+            preview_target_kwh.append(
+                SIGEN_BATTERY_CAPACITY_KWH * preview_pct / 100
+            )
+
+        def scenario_soc_at_window_start(window_start):
+            """Run the scenario through a window's start and return its SOC there."""
+            soc = float(latest_soc["Battery state of charge (%)"])
+            sold_by_window = [0.0] * len(scenario_period_slots)
+            for generation_row in scenario_generation.itertuples(index=False):
+                forecast_time = pd.Timestamp(generation_row.time_local)
+                if forecast_time <= latest_soc_time:
+                    continue
+                interval_start = max(
+                    forecast_time - pd.Timedelta(minutes=30), latest_soc_time,
+                )
+                interval_end = min(forecast_time, window_start)
+                if interval_start >= interval_end:
+                    if interval_start >= window_start:
+                        break
+                    continue
+                slot = forecast_time.strftime("%H:%M")
+                load_kw = float(load_profile.get(slot, average_load_kw))
+                solar_kw = min(
+                    SIGEN_INVERTER_LIMIT_KW,
+                    max(0.0, (float(generation_row.solcast_kw)
+                              + float(generation_row.openmeteo_kw)) / 2),
+                )
+                sale_segments = []
+                for period_index, period_start, period_end in scenario_period_slots:
+                    if period_start >= period_end:
+                        continue
+                    sale_start = max(interval_start, period_start)
+                    sale_end = min(interval_end, period_end)
+                    if sale_start < sale_end:
+                        sale_segments.append((period_index, sale_start, sale_end))
+                sale_hours = sum(
+                    (sale_end - sale_start).total_seconds() / 3600
+                    for _, sale_start, sale_end in sale_segments
+                )
+                if sale_hours > 0:
+                    max_total_export_kw = min(
+                        max(0.0, SIGEN_INVERTER_LIMIT_KW - load_kw),
+                        SIGEN_SITE_EXPORT_LIMIT_KW,
+                    )
+                    solar_export_kw = min(
+                        max(0.0, solar_kw - load_kw), max_total_export_kw,
+                    )
+                    battery_export_headroom_kw = max(
+                        0.0, max_total_export_kw - solar_export_kw,
+                    )
+                    net_battery_kwh = (
+                        (solar_kw - load_kw) * ((interval_end - interval_start).total_seconds() / 3600 - sale_hours)
+                        + (solar_kw - load_kw - solar_export_kw) * sale_hours
+                    )
+                else:
+                    battery_export_headroom_kw = 0.0
+                    net_battery_kwh = (
+                        solar_kw - load_kw
+                    ) * (interval_end - interval_start).total_seconds() / 3600
+                soc += (
+                    net_battery_kwh * 0.95
+                    if net_battery_kwh >= 0 else net_battery_kwh / 0.95
+                ) / SIGEN_BATTERY_CAPACITY_KWH * 100
+                soc = float(np.clip(soc, 0, 100))
+                for period_index, sale_start, sale_end in sale_segments:
+                    segment_hours = (sale_end - sale_start).total_seconds() / 3600
+                    sale_kwh = max(0.0, min(
+                        battery_export_headroom_kw * segment_hours,
+                        preview_target_kwh[period_index] - sold_by_window[period_index],
+                        soc / 100 * SIGEN_BATTERY_CAPACITY_KWH * 0.95,
+                    ))
+                    sold_by_window[period_index] += sale_kwh
+                    soc = max(
+                        0.0,
+                        soc - sale_kwh / (
+                            SIGEN_BATTERY_CAPACITY_KWH * 0.95
+                        ) * 100,
+                    )
+                if interval_end >= window_start:
+                    break
+            return soc
+
+        for period_index, period_start, period_end in scenario_period_slots:
+            if period_start < period_end and period_start >= latest_soc_time:
+                scenario_soc_start_by_window[period_index] = (
+                    scenario_soc_at_window_start(period_start)
+                )
+
+    # Bound each target by the scenario SOC remaining at that window's start.
+    scenario_max_sell_kwh_by_window = []
+    for period_index, period_start, period_end in scenario_period_slots:
+        start_soc = scenario_soc_start_by_window[period_index]
+        if start_soc is None:
+            scenario_max_sell_kwh_by_window.append(
+                scenario_inverter_max_sell_kwh_by_window[period_index]
+            )
+            continue
+        available_battery_kwh = max(
+            0.0, start_soc / 100 * SIGEN_BATTERY_CAPACITY_KWH * 0.95,
+        )
+        scenario_max_sell_kwh_by_window.append(min(
+            scenario_inverter_max_sell_kwh_by_window[period_index],
+            available_battery_kwh,
+        ))
     scenario_max_sell_pcts = [
         min(100, int(np.floor(
             max_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100 + 1e-9
         )))
         for max_kwh in scenario_max_sell_kwh_by_window
     ]
-    scenario_sell_pcts = []
-    for window_index, max_pct in enumerate(scenario_max_sell_pcts):
-        input_cols = st.columns([2, 1])
-        with input_cols[0]:
-            raw_pct = st.text_input(
-                f"Sell target for period {window_index + 1} (%)",
-                value=st.session_state.get(
-                    f"battery_soc_scenario_sell_pct_{window_index + 1}",
-                    str(min(20, max_pct)),
-                ),
-                key=f"battery_soc_scenario_sell_pct_{window_index + 1}",
-                help="Percentage of the 24 kWh battery to target during this sell period.",
-            )
-        with input_cols[1]:
-            st.markdown(f"**Maximum: {max_pct}%**")
+    scenario_sell_pcts = [0.0] * len(scenario_period_slots)
+    for window_index, (period_index, _, _) in enumerate(scenario_period_slots):
+        max_pct = scenario_max_sell_pcts[period_index]
+        with scenario_target_placeholders[period_index].container():
+            input_cols = st.columns([2, 1])
+            with input_cols[0]:
+                raw_pct = st.text_input(
+                    f"Sell target for period {window_index + 1} (%)",
+                    value=st.session_state.get(
+                        f"battery_soc_scenario_sell_pct_{window_index + 1}",
+                        str(min(20, max_pct)),
+                    ),
+                    key=f"battery_soc_scenario_sell_pct_{window_index + 1}",
+                    help="Percentage of the 24 kWh battery to target during this sell period.",
+                )
+            with input_cols[1]:
+                _, period_start, period_end = scenario_period_slots[window_index]
+                if period_start < period_end:
+                    period_window_text = (
+                        f"{period_start.strftime('%d %b %H:%M')}–"
+                        f"{period_end.strftime('%d %b %H:%M')}"
+                    )
+                else:
+                    period_window_text = "Invalid time window"
+                start_soc_text = (
+                    f"SOC at start {scenario_soc_start_by_window[period_index]:.1f}%"
+                    if scenario_soc_start_by_window[period_index] is not None
+                    else "SOC forecast unavailable"
+                )
+                st.markdown(
+                    f"**Maximum: {max_pct}%**  \n"
+                    f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
+                    f"{period_window_text}  ·  {start_soc_text}"
+                )
         try:
             sell_pct = float(raw_pct.strip())
             if not np.isfinite(sell_pct):
@@ -1503,7 +1657,7 @@ else:
                 f"Sell target for period {window_index + 1} exceeds its maximum; "
                 f"using {max_pct}%."
             )
-        scenario_sell_pcts.append(sell_pct)
+        scenario_sell_pcts[period_index] = sell_pct
     st.caption(
         f"Estimated additional battery export capacity across the selected windows: "
         f"{scenario_inverter_throughput_kwh:.1f} kWh. Per-window capacity: "
@@ -1628,7 +1782,7 @@ else:
                     SIGEN_BATTERY_CAPACITY_KWH * sell_pct / 100
                     for sell_pct in scenario_sell_pcts
                 ]
-                window_sold_kwh = [0.0] * len(scenario_periods)
+                window_sold_kwh = [0.0] * len(scenario_period_slots)
                 scenario_soc = current_soc
                 scenario_values = [scenario_soc]
                 for forecast_row in paired_generation.itertuples(index=False):
@@ -1643,7 +1797,9 @@ else:
                     interval_start = forecast_time - pd.Timedelta(minutes=30)
                     sale_segments = []
                     if forecast_time > latest_soc_time:
-                        for period_index, (period_start, period_end) in enumerate(scenario_periods):
+                        for period_index, period_start, period_end in scenario_period_slots:
+                            if period_start >= period_end:
+                                continue
                             sale_start = max(interval_start, period_start)
                             sale_end = min(forecast_time, period_end)
                             if sale_start < sale_end:
