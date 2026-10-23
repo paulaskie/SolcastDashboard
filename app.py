@@ -2314,8 +2314,9 @@ if not actual_intraday.empty:
     )
 
 solcast_comparison_weather = pd.DataFrame()
-if not actual_intraday.empty and not meter_power_intraday.empty:
-    solcast_power = actual_intraday.set_index("period_end_local")[["pv_estimate"]].sort_index()
+solcast_forecast_intraday = solcast_comparison_forecast(history, latest, chosen_date)
+if not solcast_forecast_intraday.empty and not meter_power_intraday.empty:
+    solcast_power = solcast_forecast_intraday.set_index("period_end_local")[["pv_estimate"]].sort_index()
     actual_times = pd.DatetimeIndex(meter_power_intraday["period_end_local"])
     combined_times = solcast_power.index.union(actual_times).sort_values()
     aligned_solcast_power = (
@@ -2325,8 +2326,8 @@ if not actual_intraday.empty and not meter_power_intraday.empty:
     )
     solcast_comparison_weather = pd.DataFrame({
         "time_local": actual_times,
-        "solcast_estimated_power_kw": aligned_solcast_power["pv_estimate"].to_numpy(),
-    }).dropna(subset=["solcast_estimated_power_kw"])
+        "solcast_forecast_power_kw": aligned_solcast_power["pv_estimate"].to_numpy(),
+    }).dropna(subset=["solcast_forecast_power_kw"])
 
 solcast_estimate_kwh = None
 solcast_meter_kwh = None
@@ -2336,11 +2337,11 @@ if not solcast_comparison_weather.empty and not meter_power_intraday.empty:
     matched_solcast_power = meter_power_intraday[
         ["period_end_local", "Solar Production (kW)"]
     ].merge(
-        solcast_comparison_weather[["time_local", "solcast_estimated_power_kw"]],
+        solcast_comparison_weather[["time_local", "solcast_forecast_power_kw"]],
         left_on="period_end_local", right_on="time_local", how="inner",
     )
     solcast_comparison_intervals = len(matched_solcast_power)
-    solcast_estimate_kwh = matched_solcast_power["solcast_estimated_power_kw"].sum() * (5 / 60)
+    solcast_estimate_kwh = matched_solcast_power["solcast_forecast_power_kw"].sum() * (5 / 60)
     solcast_meter_kwh = matched_solcast_power["Solar Production (kW)"].sum() * (5 / 60)
     if solcast_meter_kwh > 0:
         solcast_accuracy_score = max(
@@ -2408,28 +2409,28 @@ solcast_metric_cols[0].metric(
     help=solcast_full_day_basis or "Full-day Solcast data is incomplete or unavailable for the selected date.",
 )
 solcast_metric_cols[1].metric(
-    "Solcast estimated actual energy",
+    "Solcast forecast energy (matched periods)",
     f"{solcast_estimate_kwh:.2f} kWh" if solcast_estimate_kwh is not None else "—",
-    help="Estimated energy over five-minute Sigen timestamps that have matching Solcast estimated-actual data.",
+    help="Forecast energy interpolated to the five-minute Sigen timestamps available for the selected date.",
 )
 solcast_metric_cols[2].metric(
     "Sigen actual energy (matched periods)",
     f"{solcast_meter_kwh:.2f} kWh" if solcast_meter_kwh is not None else "—",
-    help="Meter energy over the same matched five-minute periods as the Solcast estimate.",
+    help="Meter energy over the same five-minute periods as the interpolated Solcast forecast.",
 )
 solcast_metric_cols[3].metric(
     "Solcast estimate accuracy",
     f"{solcast_accuracy_score:.1f}%" if solcast_accuracy_score is not None else "—",
-    help="100% minus absolute percentage error against Sigen matched-period energy, floored at 0%.",
+    help="100% minus absolute percentage error against Sigen energy over forecast-matched periods, floored at 0%.",
 )
 if solcast_comparison_intervals:
-    st.caption(f"Daily Solcast energy comparison uses {solcast_comparison_intervals:,} matched five-minute Sigen intervals.")
+    st.caption(f"Daily Solcast forecast comparison uses {solcast_comparison_intervals:,} five-minute Sigen intervals with interpolated forecast data.")
 elif meter_power_intraday.empty:
     st.caption("No Sigen power actuals are available for this date, so the energy comparison and accuracy score are unavailable.")
 else:
-    st.caption("No matching Solcast estimated-actual and Sigen timestamps are available for this date, so the energy comparison and accuracy score are unavailable.")
+    st.caption("No matching Solcast forecast and Sigen timestamps are available for this date, so the energy comparison and accuracy score are unavailable.")
 fig2 = go.Figure()
-solcast_chart_forecast = solcast_comparison_forecast(history, latest, chosen_date)
+solcast_chart_forecast = solcast_forecast_intraday
 if not solcast_chart_forecast.empty:
     fig2.add_trace(go.Scatter(
         x=solcast_chart_forecast["period_end_local"], y=solcast_chart_forecast["pv_estimate"],
@@ -2600,8 +2601,13 @@ meter_openmeteo_intraday = (
     if openmeteo_chosen_date is not None and not power_actuals.empty else pd.DataFrame()
 )
 openmeteo_aligned_to_actuals = pd.DataFrame()
-if not openmeteo_intraday.empty and not meter_openmeteo_intraday.empty:
-    weather_power = openmeteo_intraday.set_index("time_local")[[
+openmeteo_forecast_comparison = (
+    openmeteo_historical_forecast_intraday
+    if not openmeteo_historical_forecast_intraday.empty
+    else openmeteo_forecast_intraday
+)
+if not openmeteo_forecast_comparison.empty and not meter_openmeteo_intraday.empty:
+    weather_power = openmeteo_forecast_comparison.set_index("time_local")[[
         "openmeteo_power_kw", "weighted_panel_irradiance",
     ]].sort_index()
     actual_times = pd.DatetimeIndex(meter_openmeteo_intraday["period_end_local"])
@@ -2617,26 +2623,8 @@ if not openmeteo_intraday.empty and not meter_openmeteo_intraday.empty:
         "weighted_panel_irradiance": aligned_weather["weighted_panel_irradiance"].to_numpy(),
     }).dropna(subset=["openmeteo_power_kw"])
 
-# Compare estimated and measured energy over the same five-minute Sigen samples.
+# Compare forecast and measured energy over the same five-minute Sigen samples.
 comparison_weather = openmeteo_aligned_to_actuals
-forecast_weather_intraday = (
-    openmeteo_historical_forecast_intraday
-    if not openmeteo_historical_forecast_intraday.empty
-    else openmeteo_forecast_intraday
-)
-if comparison_weather.empty and not forecast_weather_intraday.empty and not meter_openmeteo_intraday.empty:
-    forecast_power = forecast_weather_intraday.set_index("time_local")[["openmeteo_power_kw"]].sort_index()
-    actual_times = pd.DatetimeIndex(meter_openmeteo_intraday["period_end_local"])
-    combined_times = forecast_power.index.union(actual_times).sort_values()
-    aligned_forecast = (
-        forecast_power.reindex(combined_times)
-        .interpolate(method="time", limit_area="inside")
-        .reindex(actual_times)
-    )
-    comparison_weather = pd.DataFrame({
-        "time_local": actual_times,
-        "openmeteo_power_kw": aligned_forecast["openmeteo_power_kw"].to_numpy(),
-    }).dropna(subset=["openmeteo_power_kw"])
 
 openmeteo_estimate_kwh = None
 meter_comparison_kwh = None
@@ -2699,26 +2687,26 @@ metric_cols[0].metric(
     help="Full-day energy from the historical forecast, live forecast, or satellite archive. Shows a dash if any part of the selected local day is missing.",
 )
 metric_cols[1].metric(
-    "Open-Meteo estimated energy",
+    "Open-Meteo forecast energy (matched periods)",
     f"{openmeteo_estimate_kwh:.2f} kWh" if openmeteo_estimate_kwh is not None else "—",
-    help="Estimated energy over Sigen timestamps that have matching Open-Meteo data.",
+    help="Forecast energy interpolated to the five-minute Sigen timestamps available for the selected date.",
 )
 metric_cols[2].metric(
     "Sigen actual energy (matched periods)",
     f"{meter_comparison_kwh:.2f} kWh" if meter_comparison_kwh is not None else "—",
-    help="Meter energy over the same matched five-minute periods as the Open-Meteo estimate.",
+    help="Meter energy over the same five-minute periods as the interpolated Open-Meteo forecast.",
 )
 metric_cols[3].metric(
     "Open-Meteo estimate accuracy",
     f"{accuracy_score:.1f}%" if accuracy_score is not None else "—",
-    help="100% minus absolute percentage error against Sigen matched-period energy, floored at 0%.",
+    help="100% minus absolute percentage error against Sigen energy over forecast-matched periods, floored at 0%.",
 )
 if comparison_intervals:
-    st.caption(f"Daily energy comparison uses {comparison_intervals:,} matched five-minute Sigen intervals.")
+    st.caption(f"Daily Open-Meteo forecast comparison uses {comparison_intervals:,} five-minute Sigen intervals with interpolated forecast data.")
 elif meter_openmeteo_intraday.empty:
     st.caption("No Sigen power actuals are available for this date, so the energy comparison and accuracy score are unavailable.")
 else:
-    st.caption("No matching Open-Meteo and Sigen timestamps are available for this date, so the energy comparison and accuracy score are unavailable.")
+    st.caption("No matching Open-Meteo forecast and Sigen timestamps are available for this date, so the energy comparison and accuracy score are unavailable.")
 
 forecast_frequency_source = (
     openmeteo_forecast_intraday
@@ -2778,8 +2766,7 @@ if not openmeteo_historical_forecast_intraday.empty:
             "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
         ),
     ))
-if (not openmeteo_forecast_intraday.empty
-        and (openmeteo_chosen_date >= today or openmeteo_historical_forecast_intraday.empty)):
+if not openmeteo_forecast_intraday.empty:
     # Keep every forecast hour visible; Sigen actuals can cover only part of today.
     plotted_forecast = openmeteo_forecast_intraday
     fig3.add_trace(go.Scatter(
@@ -2817,8 +2804,7 @@ if not openmeteo_historical_forecast_intraday.empty:
     )
     if score:
         openmeteo_accuracy_rows.append(score)
-if (not openmeteo_forecast_intraday.empty
-        and (openmeteo_chosen_date >= today or openmeteo_historical_forecast_intraday.empty)):
+if not openmeteo_forecast_intraday.empty:
     score = power_accuracy_metrics(
         "Open-Meteo weather forecast", openmeteo_forecast_intraday,
         "time_local", "openmeteo_power_kw", meter_openmeteo_intraday, 0.25,
