@@ -1,6 +1,5 @@
 """Download and store the latest Solcast forecast. Intended for Windows Task Scheduler."""
 import os
-import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -8,58 +7,47 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+from solcast_data import fetch_forecast
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
-SITE_ID = "1c66-66cb-9735-8787"
-API_URL = f"https://api.solcast.com.au/rooftop_sites/{SITE_ID}/forecasts?format=json"
-
-def parse_period_hours(period):
-    if not isinstance(period, str):
-        return 0.5
-    m = re.fullmatch(r"PT(?:(\\d+(?:\\.\\d+)?)H)?(?:(\\d+(?:\\.\\d+)?)M)?", period)
-    if not m:
-        return 0.5
-    return float(m.group(1) or 0) + float(m.group(2) or 0) / 60
-
 def main():
     api_key = os.getenv("SOLCAST_API_KEY", "").strip()
     if not api_key:
         print("ERROR: Set the SOLCAST_API_KEY environment variable for the scheduled task.", file=sys.stderr)
         return 2
-    response = requests.get(API_URL, headers={
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }, timeout=30)
-    if response.status_code in (401, 403, 402, 429):
-        print(f"ERROR: Solcast returned HTTP {response.status_code}: {response.text[:500]}", file=sys.stderr)
+    try:
+        df, _payload = fetch_forecast(api_key)
+    except requests.RequestException as exc:
+        print(f"ERROR contacting Solcast: {exc}", file=sys.stderr)
         return 1
-    response.raise_for_status()
-    payload = response.json()
-    rows = payload.get("forecasts")
-    if not isinstance(rows, list) or not rows:
-        print("ERROR: No forecasts list returned by Solcast.", file=sys.stderr)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    df = pd.DataFrame(rows)
-    if "period_end" not in df.columns or "pv_estimate" not in df.columns:
-        print("ERROR: Response missing period_end or pv_estimate fields.", file=sys.stderr)
-        return 1
-    for col in ("pv_estimate", "pv_estimate10", "pv_estimate90"):
-        if col not in df:
-            df[col] = pd.NA
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "period" not in df:
-        df["period"] = "PT30M"
-    df["period_end_utc"] = pd.to_datetime(df["period_end"], utc=True, errors="coerce")
-    df = df.dropna(subset=["period_end_utc", "pv_estimate"])
     if df.empty:
         print("ERROR: No usable forecast intervals.", file=sys.stderr)
         return 1
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    existing_tables = {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    if "forecast_intervals" in existing_tables and "solcast_forecast_30min" not in existing_tables:
+        conn.execute('ALTER TABLE "forecast_intervals" RENAME TO "solcast_forecast_30min"')
+    elif "forecast_intervals" in existing_tables and "solcast_forecast_30min" in existing_tables:
+        old_columns = {row[1] for row in conn.execute('PRAGMA table_info("forecast_intervals")')}
+        new_columns = {row[1] for row in conn.execute('PRAGMA table_info("solcast_forecast_30min")')}
+        shared_columns = sorted(old_columns.intersection(new_columns))
+        if shared_columns:
+            columns_sql = ", ".join(f'"{column}"' for column in shared_columns)
+            conn.execute(
+                f'INSERT OR IGNORE INTO "solcast_forecast_30min" ({columns_sql}) '
+                f'SELECT {columns_sql} FROM "forecast_intervals"'
+            )
+        conn.execute('DROP TABLE "forecast_intervals"')
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS forecast_intervals (
+        CREATE TABLE IF NOT EXISTS solcast_forecast_30min (
             downloaded_at_utc TEXT NOT NULL,
             period_end_utc TEXT NOT NULL,
             period TEXT,
@@ -74,7 +62,7 @@ def main():
     with conn:
         for _, row in df.iterrows():
             conn.execute("""
-                INSERT OR REPLACE INTO forecast_intervals
+                INSERT OR REPLACE INTO solcast_forecast_30min
                 (downloaded_at_utc, period_end_utc, period, pv_estimate, pv_estimate10, pv_estimate90, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
