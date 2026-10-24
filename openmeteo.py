@@ -407,20 +407,63 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 				PRIMARY KEY (location_key, date_local)
 			)
 		""")
+		latest_snapshot = conn.execute(
+			"SELECT MAX(fetched_at_utc) FROM openmeteo_forecast_snapshots WHERE location_key = ?",
+			(location_key,),
+		).fetchone()[0]
+		same_forecast = False
+		if latest_snapshot:
+			previous_snapshot = conn.execute(
+				"SELECT time_utc, global_tilted_irradiance, global_tilted_irradiance_east "
+				"FROM openmeteo_forecast_snapshots WHERE location_key = ? AND fetched_at_utc = ? "
+				"ORDER BY time_utc",
+				(location_key, latest_snapshot),
+			).fetchall()
+			incoming_snapshot = []
+			for _, row in hourly_df.iterrows():
+				local_time = pd.Timestamp(row["date"])
+				incoming_snapshot.append((
+					local_time.tz_convert("UTC").isoformat(),
+					json_value(row.get("global_tilted_irradiance")),
+					json_value(row.get("global_tilted_irradiance_east")),
+				))
+			previous_snapshot = [
+				(pd.Timestamp(row[0]).tz_convert("UTC").isoformat(), row[1], row[2])
+				for row in previous_snapshot
+			]
+			incoming_snapshot.sort(key=lambda row: row[0])
+			previous_snapshot.sort(key=lambda row: row[0])
+			same_forecast = len(incoming_snapshot) == len(previous_snapshot)
+			if same_forecast:
+				for incoming_row, previous_row in zip(incoming_snapshot, previous_snapshot):
+					if incoming_row[0] != previous_row[0]:
+						same_forecast = False
+						break
+					for incoming_value, previous_value in zip(incoming_row[1:], previous_row[1:]):
+						if incoming_value is None or previous_value is None:
+							if incoming_value is not None or previous_value is not None:
+								same_forecast = False
+								break
+						elif abs(float(incoming_value) - float(previous_value)) > 1e-9:
+							same_forecast = False
+							break
+					if not same_forecast:
+						break
 		for _, row in hourly_df.iterrows():
 			local_time = pd.Timestamp(row["date"])
 			values = {key: json_value(row[key]) for key in hourly_df.columns if key != "date"}
 			raw = json.dumps({**metadata, "time_local": local_time.isoformat(), **values}, separators=(",", ":"))
-			conn.execute("""
-				INSERT OR IGNORE INTO openmeteo_forecast_snapshots (
-					location_key, fetched_at_utc, time_utc, time_local,
-					global_tilted_irradiance, global_tilted_irradiance_east
-				) VALUES (?, ?, ?, ?, ?, ?)
-			""", (
-				location_key, fetched_at, local_time.tz_convert("UTC").isoformat(),
-				local_time.isoformat(), values.get("global_tilted_irradiance"),
-				values.get("global_tilted_irradiance_east"),
-			))
+			if not same_forecast:
+				conn.execute("""
+					INSERT OR IGNORE INTO openmeteo_forecast_snapshots (
+						location_key, fetched_at_utc, time_utc, time_local,
+						global_tilted_irradiance, global_tilted_irradiance_east
+					) VALUES (?, ?, ?, ?, ?, ?)
+				""", (
+					location_key, fetched_at, local_time.tz_convert("UTC").isoformat(),
+					local_time.isoformat(), values.get("global_tilted_irradiance"),
+					values.get("global_tilted_irradiance_east"),
+				))
 			conn.execute("""
 				INSERT INTO openmeteo_forecast_hourly (
 					location_key, time_utc, time_local, shortwave_radiation, direct_radiation,
@@ -467,13 +510,17 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 				latitude, longitude, elevation, timezone_name, model_name, fetched_at, raw,
 			))
 	conn.close()
-	return fetched_at
+	return fetched_at, not same_forecast
 
 
-forecast_fetched_at = save_openmeteo_forecast(forecast_minutely_15_df, forecast_daily_df, forecast_response)
+forecast_fetched_at, forecast_revision_saved = save_openmeteo_forecast(
+	forecast_minutely_15_df, forecast_daily_df, forecast_response,
+)
+revision_status = "saved a new forecast revision" if forecast_revision_saved else "unchanged; skipped duplicate revision"
 print(
-	f"Saved {len(forecast_minutely_15_df)} 15-minute and {len(forecast_daily_df)} daily Open-Meteo forecast rows "
-	f"to {DB_PATH.name} (fetched {forecast_fetched_at} UTC)."
+	f"Open-Meteo forecast {revision_status}; refreshed {len(forecast_minutely_15_df)} 15-minute and "
+	f"{len(forecast_daily_df)} daily current forecast rows in {DB_PATH.name} "
+	f"(fetched {forecast_fetched_at} UTC)."
 )
 
 
