@@ -21,13 +21,10 @@ Site ID is preconfigured as `1c66-66cb-9735-8787`.
 ## Install on Windows
 1. Install Python 3.11 or newer from https://www.python.org/downloads/ (enable **Add Python to PATH**).
 2. Extract this folder somewhere stable, e.g. `C:\SolcastDashboard`.
-3. Open Command Prompt in that folder and run:
+3. Double-click `run_streamlit.bat`. It creates `.venv`, installs `requirements.txt` on the first run, and launches the source app in your browser. You can also start it from Command Prompt:
 
    ```bat
-   py -m venv .venv
-   .venv\Scripts\activate
-   python -m pip install -r requirements.txt
-   streamlit run app.py
+   run_streamlit.bat
    ```
 
 4. Set `SOLCAST_API_KEY` and `AMBER_API_KEY` as Windows user environment variables, then restart the terminal and launch the dashboard. The keys are loaded automatically; click **Check API authorization** before downloading a Solcast forecast.
@@ -53,7 +50,7 @@ Give the other machine the resulting `dist\SolcastDashboard.exe`. On that machin
    setx AMBER_API_KEY "your-amber-key"
    ```
 
-3. Double-click `SolcastDashboard.exe`. It starts the local Streamlit server and opens the dashboard in the default browser. It listens on localhost.
+3. Double-click `run_local.bat` or `SolcastDashboard.exe`. The launcher checks the app folder and then `dist` for the executable. It starts the local Streamlit server and opens the dashboard in the default browser. It listens on localhost.
 
 Python and Python PATH entries are not needed on the destination machine. Network access is needed for Solcast, Amber, and Open-Meteo features. Sigen meter actuals are stored in `sigen_energy_actuals` and `sigen_power_actuals` in the SQLite database. Copy the database beside the EXE (or set `SOLCAST_DB_PATH`) to bring existing history to another machine. The Sigen Open Platform refresh additionally requires Node.js on PATH and the Sigen `sigen.mjs` client. Set `SIGEN_MCP_SCRIPT` to that script's full path if it is not in the default Codex skills location. The Open-Meteo refresh button works from the executable without a separate Python installation.
 
@@ -62,6 +59,22 @@ To choose another writable database location, set `SOLCAST_DB_PATH` to its full 
 ```bat
 SolcastDashboard.exe
 ```
+
+## Deploy on Streamlit Community Cloud
+
+Community Cloud launches `app_streamlit_io.py` from the selected GitHub branch; it does not use either Windows batch launcher. Select `paulaskie/SolcastDashboard`, branch `main`, and `app_streamlit_io.py` as the app file. The entry point uses the bundled `solcast_history.sqlite3` as its starting database and passes Community Cloud secrets through to the existing dashboard.
+
+In the app's **Advanced settings → Secrets** field, add the following TOML and replace the placeholders with your own values:
+
+```toml
+SOLCAST_API_KEY = "your-solcast-api-key"
+AMBER_API_KEY = "your-amber-api-key"
+SIGEN_EXPORT_LIMIT_KW = "10"
+```
+
+`SOLCAST_API_KEY` enables Solcast forecast and estimated-actual downloads. `AMBER_API_KEY` enables Amber price updates. `SIGEN_EXPORT_LIMIT_KW` is an optional site export-limit assumption used by the battery-sale estimate; it defaults to `10` kW. Open-Meteo does not require an API key. Never put these values in GitHub or a committed `secrets.toml` file.
+
+The bundled database contains the existing forecast, price, Open-Meteo, and Sigen history. Because the GitHub repository is public, anyone who can access the repository can download that database. Community Cloud also does not guarantee persistence for files changed while the app is running: API refreshes can update the deployed copy temporarily, but those changes may be lost after a restart or redeploy. Use an external persistent database if refreshed history must be retained reliably. The Sigen refresh button additionally requires the Node.js `sigen.mjs` client, which is not bundled in this repository; existing Sigen history remains available in the bundled database.
 
 The keys are read from the process environment and sent to Solcast or Amber in HTTPS `Authorization: Bearer` headers. They are not stored in the SQLite database or shown in the dashboard. Do not commit or share API keys.
 
