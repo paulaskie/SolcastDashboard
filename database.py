@@ -3,6 +3,7 @@
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 import turso_serverless
@@ -58,8 +59,23 @@ def pull_turso_snapshot(database_path):
         if not tables:
             raise RuntimeError("The Turso database does not contain dashboard tables.")
 
+        table_group = {
+            "amber_prices": "amber",
+            "amber_price_forecast_snapshots": "amber",
+            "sigen_energy_actuals": "sigen",
+            "sigen_power_actuals": "sigen",
+        }
+        group_priority = {"amber": 0, "sigen": 1}
+        tables.sort(
+            key=lambda table: (
+                group_priority.get(table_group.get(table[0]), 2),
+                table[0],
+            )
+        )
+
         row_counts = {}
         for table_name, create_sql in tables:
+            table_started_at = time.perf_counter()
             quoted_table = '"' + table_name.replace('"', '""') + '"'
             if not create_sql:
                 continue
@@ -101,6 +117,17 @@ def pull_turso_snapshot(database_path):
                 ),
             )
             row_counts[table_name] = len(remote_rows)
+            print(
+                "PERF operation=turso_snapshot_table group=%s table=%s rows=%d "
+                "duration_seconds=%.3f"
+                % (
+                    table_group.get(table_name, "other"),
+                    table_name,
+                    len(remote_rows),
+                    time.perf_counter() - table_started_at,
+                ),
+                flush=True,
+            )
 
         indexes = remote.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
