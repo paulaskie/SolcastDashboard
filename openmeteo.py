@@ -1,10 +1,11 @@
 import argparse
 import json
 import os
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from database import connect_database
 
 import openmeteo_requests
 
@@ -221,7 +222,7 @@ def save_openmeteo_data(hourly_df, daily_df):
 		"utc_offset_seconds": utc_offset_seconds,
 		"model": params["models"],
 	}
-	conn = sqlite3.connect(DB_PATH)
+	conn = connect_database(DB_PATH)
 	ensure_weather_tables(conn)
 	with conn:
 		# Correct legacy daily keys if a timezone/DST conversion labeled them by the prior day.
@@ -375,7 +376,7 @@ def save_openmeteo_forecast(hourly_df, daily_df, response):
 		"north_tilt": 22, "north_azimuth": 180,
 		"east_tilt": 22, "east_azimuth": -90,
 	}
-	conn = sqlite3.connect(DB_PATH)
+	conn = connect_database(DB_PATH)
 	with conn:
 		conn.execute("""
 			CREATE TABLE IF NOT EXISTS openmeteo_forecast_hourly (
@@ -599,7 +600,7 @@ def save_openmeteo_historical_forecast(hourly_df, response):
 		"direct_normal_irradiance", "global_tilted_irradiance",
 		"global_tilted_irradiance_east", "terrestrial_radiation",
 	]
-	conn = sqlite3.connect(DB_PATH)
+	conn = connect_database(DB_PATH)
 	with conn:
 		conn.execute("""
 			CREATE TABLE IF NOT EXISTS openmeteo_historical_forecast_hourly (

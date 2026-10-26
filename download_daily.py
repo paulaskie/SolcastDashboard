@@ -1,9 +1,10 @@
 """Download and store the latest Solcast forecast. Intended for Windows Task Scheduler."""
 import os
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from database import connect_database
 
 import pandas as pd
 import requests
@@ -29,7 +30,7 @@ def main():
         return 1
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_database(DB_PATH)
     existing_tables = {
         row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }

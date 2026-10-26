@@ -22,6 +22,8 @@ for secret_name in (
     "SIGEN_REGION",
     "SIGEN_API_BASE_URL",
     "SIGEN_SYSTEM_ID",
+    "TURSO_DATABASE_URL",
+    "TURSO_AUTH_TOKEN",
 ):
     if os.getenv(secret_name):
         continue
@@ -31,10 +33,19 @@ for secret_name in (
         continue
     os.environ[secret_name] = str(secret_value)
 
-if not DATABASE_PATH.is_file():
+has_turso_url = bool(os.getenv("TURSO_DATABASE_URL", "").strip())
+has_turso_token = bool(os.getenv("TURSO_AUTH_TOKEN", "").strip())
+if has_turso_url != has_turso_token:
+    st.error(
+        "Set both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN, or remove both "
+        "to use the bundled database."
+    )
+    st.stop()
+
+if not has_turso_url and not DATABASE_PATH.is_file():
     st.error(
         "The bundled solcast_history.sqlite3 database is missing. "
-        "Include it in the GitHub branch used for this deployment."
+        "Configure Turso or include it in the GitHub branch used for this deployment."
     )
     st.stop()
 

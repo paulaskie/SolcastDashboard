@@ -62,7 +62,7 @@ SolcastDashboard.exe
 
 ## Deploy on Streamlit Community Cloud
 
-Community Cloud launches `app_streamlit_io.py` from the selected GitHub branch; it does not use either Windows batch launcher. Select `paulaskie/SolcastDashboard`, branch `main`, and `app_streamlit_io.py` as the app file. The entry point uses the bundled `solcast_history.sqlite3` as its starting database and passes Community Cloud secrets through to the existing dashboard.
+Community Cloud launches `app_streamlit_io.py` from the selected GitHub branch; it does not use either Windows batch launcher. Select `paulaskie/SolcastDashboard`, a branch containing the app version you want to deploy (for example, `sigen-developer-api`), and `app_streamlit_io.py` as the app file.
 
 In the app's **Advanced settings → Secrets** field, add the following TOML and replace the placeholders with your own values:
 
@@ -85,9 +85,30 @@ SIGEN_SYSTEM_ID = "your-sigen-system-id"
 
 The app authenticates with the App Key and App Secret, then requests `GET /openapi/systems/{systemId}/history` at `level=Day` for the selected date. The Developer API permits one history request per station every five minutes, so the Streamlit control fetches one day at a time. The local Node-based flow remains available when these Developer API credentials are not configured. Keep the App Secret in Streamlit secrets; never commit it to GitHub.
 
+### Persistent Turso database
+
+The app uses the bundled SQLite database by default. To persist data refreshed by the Cloud app, create a Turso database and an auth token, then add these top-level values in **Advanced settings → Secrets**:
+
+```toml
+TURSO_DATABASE_URL = "your-database-url"
+TURSO_AUTH_TOKEN = "your-database-auth-token"
+```
+
+The app uses Turso when both values are set and continues to use local SQLite when neither is set. Set both values; a partial configuration is reported as an error. Keep the auth token private.
+
+To copy the bundled history to a new, empty Turso database before deployment, run the migration utility locally in PowerShell. Set the URL and token in your current PowerShell session (do not commit them), then run:
+
+```powershell
+$env:TURSO_DATABASE_URL = "your-database-url"
+$env:TURSO_AUTH_TOKEN = "your-database-auth-token"
+python migrate_to_turso.py
+```
+
+The migration copies the bundled tables and records and can resume after an interrupted run. It refuses to mix the bundled history into a Turso database that already contains application data. If you skip migration, the app initializes its tables on Turso, but existing bundled history is not copied. Once configured, Streamlit Cloud reads and writes refreshed data directly to Turso rather than its temporary local copy.
+
 `SOLCAST_API_KEY` enables Solcast forecast and estimated-actual downloads. `AMBER_API_KEY` enables Amber price updates. `SIGEN_EXPORT_LIMIT_KW` is an optional site export-limit assumption used by the battery-sale estimate; it defaults to `10` kW. Open-Meteo does not require an API key. Never put these values in GitHub or a committed `secrets.toml` file.
 
-The bundled database contains the existing forecast, price, Open-Meteo, and Sigen history. Because the GitHub repository is public, anyone who can access the repository can download that database. Community Cloud also does not guarantee persistence for files changed while the app is running: API refreshes can update the deployed copy temporarily, but those changes may be lost after a restart or redeploy. Use an external persistent database if refreshed history must be retained reliably.
+The bundled database contains the existing forecast, price, Open-Meteo, AEMO, and Sigen history. Because the GitHub repository is public, anyone who can access the repository can download that database. Without Turso settings, Community Cloud uses its temporary local copy, so refreshes may be lost after a restart or redeploy.
 
 The keys are read from the process environment and sent to Solcast or Amber in HTTPS `Authorization: Bearer` headers. They are not stored in the SQLite database or shown in the dashboard. Do not commit or share API keys.
 

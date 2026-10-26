@@ -3,11 +3,11 @@
 import argparse
 import json
 import os
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from amber_data import fetch_prices
+from database import connect_database
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
@@ -29,7 +29,7 @@ def main():
     temporary_json_path.replace(json_path)
 
     fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_database(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS amber_prices (
                 start_time_utc TEXT NOT NULL,

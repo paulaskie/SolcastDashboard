@@ -5,3 +5,4 @@ requests>=2.32
 openmeteo-requests>=1.2
 requests-cache>=1.2
 retry-requests>=2.0
+turso-serverless>=0.1.0,<0.2.0

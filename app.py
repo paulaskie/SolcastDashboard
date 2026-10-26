@@ -1,11 +1,12 @@
 import os
-import sqlite3
 import json
 import subprocess
 import sys
 import math
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+
+from database import DB_OPERATIONAL_ERRORS, connect_database, read_sql_query
 
 import pandas as pd
 import numpy as np
@@ -39,7 +40,7 @@ OPENMETEO_CALIBRATION_DATE = "2026-10-09"
 st.set_page_config(page_title="Solar Forecast", page_icon="☀️", layout="wide")
 
 def connect_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_database(DB_PATH)
     table_renames = (
         ("forecast_intervals", "solcast_forecast_30min"),
         ("actual_intervals", "solcast_estimate_30min"),
@@ -352,10 +353,10 @@ def show_amber_rate_limit_from_error(error):
 
 def load_amber_prices():
     conn = connect_db()
-    actuals = pd.read_sql_query(
+    actuals = read_sql_query(
         "SELECT * FROM amber_prices WHERE lower(price_type) <> 'forecastinterval'", conn,
     )
-    forecasts = pd.read_sql_query(
+    forecasts = read_sql_query(
         "SELECT * FROM amber_price_forecast_snapshots ORDER BY fetched_at_utc DESC", conn,
     )
     conn.close()
@@ -372,7 +373,7 @@ def save_forecast(df, payload):
         "SELECT MAX(downloaded_at_utc) FROM solcast_forecast_30min"
     ).fetchone()[0]
     if latest_snapshot:
-        previous = pd.read_sql_query(
+        previous = read_sql_query(
             "SELECT period_end_utc, period, pv_estimate, pv_estimate10, pv_estimate90 "
             "FROM solcast_forecast_30min WHERE downloaded_at_utc = ? ORDER BY period_end_utc",
             conn, params=(latest_snapshot,),
@@ -444,7 +445,7 @@ def save_actuals(df, downloaded_at):
 
 def load_latest_actuals():
     conn = connect_db()
-    actuals = pd.read_sql_query("SELECT * FROM solcast_estimate_30min ORDER BY downloaded_at_utc, period_end_utc", conn)
+    actuals = read_sql_query("SELECT * FROM solcast_estimate_30min ORDER BY downloaded_at_utc, period_end_utc", conn)
     conn.close()
     if actuals.empty:
         return actuals
@@ -462,7 +463,7 @@ def load_latest_actuals():
 
 def load_history():
     conn = connect_db()
-    hist = pd.read_sql_query("SELECT * FROM solcast_forecast_30min ORDER BY downloaded_at_utc, period_end_utc", conn)
+    hist = read_sql_query("SELECT * FROM solcast_forecast_30min ORDER BY downloaded_at_utc, period_end_utc", conn)
     conn.close()
     if hist.empty:
         for column in ("period_end_local", "period_hours", "energy_kwh", "local_date"):
@@ -500,7 +501,7 @@ def solcast_comparison_forecast(history, latest_forecast, local_date):
 def load_openmeteo_hourly():
     conn = connect_db()
     try:
-        weather = pd.read_sql_query(
+        weather = read_sql_query(
             "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
             "global_tilted_irradiance_east "
             "FROM openmeteo_estimate_hourly "
@@ -508,7 +509,7 @@ def load_openmeteo_hourly():
             "ORDER BY fetched_at_utc DESC LIMIT 1) ORDER BY time_utc",
             conn,
         )
-    except sqlite3.OperationalError:
+    except DB_OPERATIONAL_ERRORS:
         return pd.DataFrame()
     finally:
         conn.close()
@@ -517,7 +518,7 @@ def load_openmeteo_hourly():
 def load_openmeteo_forecast_hourly():
     conn = connect_db()
     try:
-        weather = pd.read_sql_query(
+        weather = read_sql_query(
             "WITH ranked_forecasts AS ("
             "SELECT time_utc, time_local, global_tilted_irradiance, "
             "global_tilted_irradiance_east, fetched_at_utc, "
@@ -529,7 +530,7 @@ def load_openmeteo_forecast_hourly():
             "FROM ranked_forecasts WHERE row_num = 1 ORDER BY time_utc",
             conn,
         )
-    except sqlite3.OperationalError:
+    except DB_OPERATIONAL_ERRORS:
         return pd.DataFrame()
     finally:
         conn.close()
@@ -538,13 +539,13 @@ def load_openmeteo_forecast_hourly():
 def load_openmeteo_forecast_snapshots():
     conn = connect_db()
     try:
-        weather = pd.read_sql_query(
+        weather = read_sql_query(
             "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
             "global_tilted_irradiance_east FROM openmeteo_forecast_snapshots "
             "ORDER BY fetched_at_utc, time_utc",
             conn,
         )
-    except sqlite3.OperationalError:
+    except DB_OPERATIONAL_ERRORS:
         return pd.DataFrame()
     finally:
         conn.close()
@@ -553,7 +554,7 @@ def load_openmeteo_forecast_snapshots():
 def load_openmeteo_historical_forecast_hourly():
     conn = connect_db()
     try:
-        weather = pd.read_sql_query(
+        weather = read_sql_query(
             "WITH ranked_forecasts AS ("
             "SELECT time_utc, time_local, fetched_at_utc, global_tilted_irradiance, "
             "global_tilted_irradiance_east, "
@@ -565,7 +566,7 @@ def load_openmeteo_historical_forecast_hourly():
             "FROM ranked_forecasts WHERE row_num = 1 ORDER BY time_utc",
             conn,
         )
-    except sqlite3.OperationalError:
+    except DB_OPERATIONAL_ERRORS:
         return pd.DataFrame()
     finally:
         conn.close()
@@ -576,13 +577,13 @@ def load_openmeteo_daily():
     daily_frames = []
     for table in ("openmeteo_estimate_daily", "openmeteo_forecast_daily"):
         try:
-            weather_daily = pd.read_sql_query(
+            weather_daily = read_sql_query(
                 f"SELECT date_local, sunrise_local, sunset_local, daylight_duration FROM {table} "
                 f"WHERE location_key = (SELECT location_key FROM {table} "
                 "ORDER BY fetched_at_utc DESC LIMIT 1)",
                 conn,
             )
-        except sqlite3.OperationalError:
+        except DB_OPERATIONAL_ERRORS:
             continue
         if not weather_daily.empty:
             daily_frames.append(weather_daily)
@@ -842,11 +843,11 @@ def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
 
 def load_meter_actuals():
     conn = connect_db()
-    energy = pd.read_sql_query(
+    energy = read_sql_query(
         "SELECT period_end_utc, energy_kwh, battery_soc, raw_json "
         "FROM sigen_energy_actuals ORDER BY period_end_utc", conn,
     )
-    power = pd.read_sql_query("SELECT period_end_utc, power_kw FROM sigen_power_actuals ORDER BY period_end_utc", conn)
+    power = read_sql_query("SELECT period_end_utc, power_kw FROM sigen_power_actuals ORDER BY period_end_utc", conn)
     conn.close()
     if not energy.empty:
         energy["period_end_utc"] = pd.to_datetime(energy["period_end_utc"], utc=True)
@@ -900,7 +901,11 @@ st.caption("Rooftop PV forecast · Daily energy estimates in Australia/Sydney ti
 
 with st.sidebar:
     st.header("Controls")
-    st.caption(f"Local database · {DB_PATH.name}")
+    database_label = (
+        "Turso Cloud" if os.getenv("TURSO_DATABASE_URL", "").strip()
+        else f"Local database · {DB_PATH.name}"
+    )
+    st.caption(database_label)
     api_key = os.getenv("SOLCAST_API_KEY", "").strip()
     with st.expander("Solcast", expanded=True):
         st.caption(f"API key {'ready' if api_key else 'missing'} · Site {SITE_ID_DEFAULT}")
