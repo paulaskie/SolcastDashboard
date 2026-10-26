@@ -17,6 +17,7 @@ from amber_data import fetch_current_prices as fetch_amber_current_prices
 from amber_data import fetch_actuals_between as fetch_amber_actuals_between
 from amber_data import fetch_prices as fetch_amber_prices
 from sigen_data import STATION_ID as SIGEN_STATION_ID
+from sigen_data import developer_api_configured as sigen_developer_api_configured
 from sigen_data import fetch_actuals as fetch_sigen_actuals
 from solcast_data import (
     SITE_ID as SITE_ID_DEFAULT,
@@ -927,18 +928,32 @@ with st.sidebar:
         )
 
     with st.expander("Sigen actuals"):
-        st.caption(f"Station {SIGEN_STATION_ID}")
-        sigen_start_date = date_picker_with_arrows(
-            "Start date", value=pd.Timestamp("2026-10-01").date(), key="sigen_start_date",
-        )
-        sigen_end_date = date_picker_with_arrows(
-            "End date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_end_date",
-            min_value=sigen_start_date,
-        )
+        if sigen_developer_api_configured():
+            sigen_start_date = date_picker_with_arrows(
+                "History date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_api_history_date",
+            )
+            sigen_end_date = sigen_start_date
+            st.caption(
+                "Using the Sigen Developer API. It limits history access to one request per station "
+                "every five minutes, so update one day at a time."
+            )
+        else:
+            st.caption(f"Station {SIGEN_STATION_ID}")
+            sigen_start_date = date_picker_with_arrows(
+                "Start date", value=pd.Timestamp("2026-10-01").date(), key="sigen_start_date",
+            )
+            sigen_end_date = date_picker_with_arrows(
+                "End date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_end_date",
+                min_value=sigen_start_date,
+            )
         sigen_update_clicked = st.button(
             "Update power actuals", width="stretch",
             disabled=sigen_end_date < sigen_start_date,
-            help="Reads five-minute Sigen power through the selected end date. Authorization is handled by the installed Sigen client.",
+            help=(
+                "Reads the selected day's five-minute Sigen power history from the Developer API."
+                if sigen_developer_api_configured() else
+                "Reads five-minute Sigen power through the selected end date using the installed Sigen client."
+            ),
         )
 
     with st.expander("Amber prices"):
@@ -1065,7 +1080,7 @@ if amber_48_clicked:
 
 if sigen_update_clicked:
     try:
-        with st.spinner("Updating meter actuals from Sigen Open Platform…"):
+        with st.spinner("Updating meter actuals from Sigen…"):
             sigen_energy, sigen_power, sigen_quota = fetch_sigen_actuals(
                 SIGEN_STATION_ID, sigen_start_date, sigen_end_date, include_quota=True,
             )

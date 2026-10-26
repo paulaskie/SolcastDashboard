@@ -72,15 +72,28 @@ AMBER_API_KEY = "your-amber-api-key"
 SIGEN_EXPORT_LIMIT_KW = "10"
 ```
 
+To refresh Sigen actuals directly from the Sigen Developer API without Node.js, add these secrets as well:
+
+```toml
+SIGEN_APP_KEY = "your-sigen-app-key"
+SIGEN_APP_SECRET = "your-sigen-app-secret"
+SIGEN_REGION = "aus"
+SIGEN_API_BASE_URL = "https://openapi-aus.sigencloud.com"
+# Optional: set this if your account has multiple systems. If omitted, the app uses the first system from the API list.
+SIGEN_SYSTEM_ID = "your-sigen-system-id"
+```
+
+The app authenticates with the App Key and App Secret, then requests `GET /openapi/systems/{systemId}/history` at `level=Day` for the selected date. The Developer API permits one history request per station every five minutes, so the Streamlit control fetches one day at a time. The local Node-based flow remains available when these Developer API credentials are not configured. Keep the App Secret in Streamlit secrets; never commit it to GitHub.
+
 `SOLCAST_API_KEY` enables Solcast forecast and estimated-actual downloads. `AMBER_API_KEY` enables Amber price updates. `SIGEN_EXPORT_LIMIT_KW` is an optional site export-limit assumption used by the battery-sale estimate; it defaults to `10` kW. Open-Meteo does not require an API key. Never put these values in GitHub or a committed `secrets.toml` file.
 
-The bundled database contains the existing forecast, price, Open-Meteo, and Sigen history. Because the GitHub repository is public, anyone who can access the repository can download that database. Community Cloud also does not guarantee persistence for files changed while the app is running: API refreshes can update the deployed copy temporarily, but those changes may be lost after a restart or redeploy. Use an external persistent database if refreshed history must be retained reliably. The Sigen refresh button additionally requires the Node.js `sigen.mjs` client, which is not bundled in this repository; existing Sigen history remains available in the bundled database.
+The bundled database contains the existing forecast, price, Open-Meteo, and Sigen history. Because the GitHub repository is public, anyone who can access the repository can download that database. Community Cloud also does not guarantee persistence for files changed while the app is running: API refreshes can update the deployed copy temporarily, but those changes may be lost after a restart or redeploy. Use an external persistent database if refreshed history must be retained reliably.
 
 The keys are read from the process environment and sent to Solcast or Amber in HTTPS `Authorization: Bearer` headers. They are not stored in the SQLite database or shown in the dashboard. Do not commit or share API keys.
 
 Set the `AMBER_API_KEY` environment variable to enable Amber downloads in the dashboard. Select a Sydney date and choose **Fetch Amber prices and 2-day forecast** to fetch that date from `/prices` plus the next 576 intervals from `/prices/current`, or choose **Fetch next 48 five-minute periods** to request `next=48&resolution=5`. Current forecast downloads are retained as snapshots; for each interval, the chart selects the newest non-null value and falls back to older snapshots when needed. Actual intervals take precedence where available. The graph can show all channels or filter to `general`, `controlledLoad`, or `feedIn`. The key is sent only in HTTPS authorization headers and is not stored in SQLite. You can also run `python download_amber.py YYYY-MM-DD` to fetch a date from a terminal.
 
-Meter actuals are loaded exclusively from the `sigen_energy_actuals` and `sigen_power_actuals` tables in `solcast_history.sqlite3`. The **Sigen Open Platform** sidebar displays the configured station ID and lets you select a date range. **Update Power Actuals from Sigen** requests each selected day of five-minute energy statistics through the installed Sigen Open Platform client, writes power and derived five-minute energy values plus raw Sigen rows into SQLite, and updates the graphs. The station ID and extraction settings are in `sigen_data.py`. The Node client handles Sigen browser authorization; set `SIGEN_MCP_SCRIPT` only if `sigen.mjs` is installed at a non-default path.
+Meter actuals are loaded exclusively from the `sigen_energy_actuals` and `sigen_power_actuals` tables in `solcast_history.sqlite3`. The **Sigen actuals** sidebar lets you select a date and update five-minute power and derived energy values plus raw Sigen rows. Streamlit Community Cloud can use the Sigen Developer API credentials above; local installations without those credentials continue to use the Node-based Sigen Open Platform client. The API settings and parsing are in `sigen_data.py`.
 
 Use **AEMO historical prices** in the sidebar to import public five-minute dispatch prices for a selected AEMO market-date range. Records for all five NEM regions are stored in `aemo_prices`; `per_kwh` and `spot_per_kwh` convert AEMO RRP and ROP from AUD/MWh to cents/kWh, with the original fields retained in `raw_json`. AEMO dispatch timestamps use fixed AEST (UTC+10), and the importer converts them to UTC for storage. AEMO's daily archives may lag recent dispatch dates; the importer saves available dates and reports unavailable archives.
 

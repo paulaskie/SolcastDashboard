@@ -17,6 +17,11 @@ for secret_name in (
     "SOLCAST_API_KEY",
     "AMBER_API_KEY",
     "SIGEN_EXPORT_LIMIT_KW",
+    "SIGEN_APP_KEY",
+    "SIGEN_APP_SECRET",
+    "SIGEN_REGION",
+    "SIGEN_API_BASE_URL",
+    "SIGEN_SYSTEM_ID",
 ):
     if os.getenv(secret_name):
         continue
