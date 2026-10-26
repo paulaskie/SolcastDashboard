@@ -14,6 +14,7 @@ A local Streamlit app for your Solcast rooftop-site forecast endpoint.
 - Saves every download to a local SQLite database (`solcast_history.sqlite3`).
 - Stores Solcast forecast intervals in `solcast_forecast_30min` and estimated actuals in `solcast_estimate_30min`.
 - Export latest intervals or all stored snapshots to CSV.
+- Date changes in the Solcast and Open-Meteo power and forecast-revision charts rerun only their respective chart sections in Streamlit.
 - Optional Windows Task Scheduler script for a daily download even when the dashboard is closed.
 
 Site ID is preconfigured as `1c66-66cb-9735-8787`.
