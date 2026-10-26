@@ -1,8 +1,11 @@
 import os
 import json
+import functools
+import logging
 import subprocess
 import sys
 import math
+import time
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 
@@ -45,7 +48,36 @@ OPENMETEO_CALIBRATION_DATE = "2026-10-09"
 
 st.set_page_config(page_title="Solar Forecast", page_icon="☀️", layout="wide")
 
+performance_logger = logging.getLogger("solcast.performance")
+performance_logger.setLevel(logging.INFO)
+
+
+def log_performance(function):
+    @functools.wraps(function)
+    def timed_function(*args, **kwargs):
+        started_at = time.perf_counter()
+        try:
+            result = function(*args, **kwargs)
+        except Exception as error:
+            performance_logger.error(
+                "PERF operation=%s status=error error_type=%s duration_seconds=%.3f",
+                function.__name__,
+                type(error).__name__,
+                time.perf_counter() - started_at,
+            )
+            raise
+        performance_logger.info(
+            "PERF operation=%s duration_seconds=%.3f",
+            function.__name__,
+            time.perf_counter() - started_at,
+        )
+        return result
+
+    return timed_function
+
+
 @st.cache_resource
+@log_performance
 def _initialize_db(database_path, database_url):
     conn = connect_database(database_path)
     table_renames = (
@@ -363,6 +395,7 @@ def show_amber_rate_limit_from_error(error):
     if remaining is not None:
         st.caption(amber_rate_limit_message(response=remaining))
 
+@log_performance
 def load_amber_prices():
     conn = connect_db()
     actuals = read_sql_query(
@@ -455,6 +488,7 @@ def save_actuals(df, downloaded_at):
             ))
     conn.close()
 
+@log_performance
 def load_latest_actuals():
     conn = connect_db()
     actuals = read_sql_query("SELECT * FROM solcast_estimate_30min ORDER BY downloaded_at_utc, period_end_utc", conn)
@@ -473,6 +507,7 @@ def load_latest_actuals():
     actuals["energy_kwh"] = actuals["pv_estimate"] * actuals["period_hours"]
     return actuals.sort_values("period_end_local")
 
+@log_performance
 def load_history():
     conn = connect_db()
     hist = read_sql_query("SELECT * FROM solcast_forecast_30min ORDER BY downloaded_at_utc, period_end_utc", conn)
@@ -510,6 +545,7 @@ def solcast_comparison_forecast(history, latest_forecast, local_date):
     return (pd.concat([latest_day, previous], ignore_index=True)
             .sort_values("period_end_local"))
 
+@log_performance
 def load_openmeteo_hourly():
     conn = connect_db()
     try:
@@ -527,6 +563,7 @@ def load_openmeteo_hourly():
         conn.close()
     return prepare_openmeteo_estimates(weather)
 
+@log_performance
 def load_openmeteo_forecast_hourly():
     conn = connect_db()
     try:
@@ -548,6 +585,7 @@ def load_openmeteo_forecast_hourly():
         conn.close()
     return prepare_openmeteo_estimates(weather)
 
+@log_performance
 def load_openmeteo_forecast_snapshots():
     conn = connect_db()
     try:
@@ -563,6 +601,7 @@ def load_openmeteo_forecast_snapshots():
         conn.close()
     return prepare_openmeteo_estimates(weather)
 
+@log_performance
 def load_openmeteo_historical_forecast_hourly():
     conn = connect_db()
     try:
@@ -584,6 +623,7 @@ def load_openmeteo_historical_forecast_hourly():
         conn.close()
     return prepare_openmeteo_estimates(weather)
 
+@log_performance
 def load_openmeteo_daily():
     conn = connect_db()
     daily_frames = []
@@ -636,6 +676,7 @@ def prepare_openmeteo_estimates(weather):
     )
     return weather.dropna(subset=["time_local", "openmeteo_power_kw"])
 
+@log_performance
 def calibrate_openmeteo_performance_ratio(archive_weather, meter_power):
     """Fit a fixed PV performance ratio from matching archive and meter samples."""
     if archive_weather.empty or meter_power.empty:
@@ -853,6 +894,7 @@ def save_meter_actuals(energy_actuals, power_actuals, source_file=None):
             ))
     conn.close()
 
+@log_performance
 def load_meter_actuals():
     conn = connect_db()
     energy = read_sql_query(

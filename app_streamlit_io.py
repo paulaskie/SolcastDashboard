@@ -1,12 +1,17 @@
 """Streamlit Community Cloud entry point for the dashboard."""
 
 import os
+import logging
 import runpy
+import time
 from pathlib import Path
 
 import streamlit as st
 from database import USE_TURSO_ENV
 
+
+performance_logger = logging.getLogger("solcast.performance")
+performance_logger.setLevel(logging.INFO)
 
 APP_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = APP_DIR / "solcast_history.sqlite3"
@@ -59,12 +64,38 @@ if has_turso_url:
     def _load_turso_snapshot(database_path, database_url):
         from database import pull_turso_snapshot
 
-        return pull_turso_snapshot(database_path)
+        snapshot_started_at = time.perf_counter()
+        try:
+            snapshot_rows = pull_turso_snapshot(database_path)
+        except Exception as error:
+            performance_logger.error(
+                "PERF operation=turso_snapshot status=error error_type=%s "
+                "duration_seconds=%.3f",
+                type(error).__name__,
+                time.perf_counter() - snapshot_started_at,
+            )
+            raise
+        performance_logger.info(
+            "PERF operation=turso_snapshot tables=%d rows=%d duration_seconds=%.3f",
+            len(snapshot_rows),
+            sum(snapshot_rows.values()),
+            time.perf_counter() - snapshot_started_at,
+        )
+        return snapshot_rows
 
     try:
-        _load_turso_snapshot(str(DATABASE_PATH), os.getenv("TURSO_DATABASE_URL", "").strip())
+        _load_turso_snapshot(
+            str(DATABASE_PATH), os.getenv("TURSO_DATABASE_URL", "").strip()
+        )
     except Exception as error:
         st.error(f"Could not load the Turso database snapshot: {error}")
         st.stop()
 
-runpy.run_path(str(APP_DIR / "app.py"), run_name="__main__")
+dashboard_started_at = time.perf_counter()
+try:
+    runpy.run_path(str(APP_DIR / "app.py"), run_name="__main__")
+finally:
+    performance_logger.info(
+        "PERF operation=dashboard_script duration_seconds=%.3f",
+        time.perf_counter() - dashboard_started_at,
+    )
