@@ -41,20 +41,20 @@ def _api_base_url():
     return f"https://openapi-{region}.sigencloud.com"
 
 
-def _api_headers(token):
+def _api_headers(token, token_type):
     region = os.getenv("SIGEN_REGION", "aus").strip().lower()
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"{token_type} {token}",
         "sigen-region": region,
         "Accept": "application/json",
     }
 
 
-def _api_request(method, path, token=None, **kwargs):
+def _api_request(method, path, token=None, token_type=None, **kwargs):
     url = f"{_api_base_url()}/{path.lstrip('/')}"
     headers = kwargs.pop("headers", {})
     if token:
-        headers.update(_api_headers(token))
+        headers.update(_api_headers(token, token_type or "Bearer"))
     response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
     response.raise_for_status()
     try:
@@ -79,14 +79,17 @@ def _developer_api_token():
     data = _decode_api_data(payload.get("data"))
     if not isinstance(data, dict) or not data.get("accessToken"):
         raise RuntimeError("Sigen authentication succeeded without returning an access token.")
-    return data["accessToken"]
+    token_type = data.get("tokenType")
+    if not isinstance(token_type, str) or not token_type.strip():
+        raise RuntimeError("Sigen authentication succeeded without returning a token type.")
+    return data["accessToken"], token_type
 
 
-def _developer_system_id(token):
+def _developer_system_id(token, token_type):
     configured = os.getenv("SIGEN_SYSTEM_ID", "").strip()
     if configured:
         return configured
-    payload = _api_request("GET", "/openapi/system", token=token)
+    payload = _api_request("GET", "/openapi/system", token=token, token_type=token_type)
     systems = _decode_api_data(payload.get("data"))
     if isinstance(systems, dict):
         systems = systems.get("itemList") or systems.get("list") or systems.get("systems") or []
@@ -101,12 +104,13 @@ def _developer_system_id(token):
 
 
 def _fetch_developer_api_day(day):
-    token = _developer_api_token()
-    system_id = _developer_system_id(token)
+    token, token_type = _developer_api_token()
+    system_id = _developer_system_id(token, token_type)
     payload = _api_request(
         "GET",
         f"/openapi/systems/{system_id}/history",
         token=token,
+        token_type=token_type,
         params={"level": "Day", "date": day.strftime("%Y-%m-%d")},
     )
     data = _decode_api_data(payload.get("data"))
