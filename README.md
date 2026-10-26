@@ -118,7 +118,7 @@ Then use **Database sync → Upload local database to Turso** and confirm before
 
 `SOLCAST_API_KEY` enables Solcast forecast and estimated-actual downloads. `AMBER_API_KEY` enables Amber price updates. `SIGEN_EXPORT_LIMIT_KW` is an optional site export-limit assumption used by the battery-sale estimate; it defaults to `10` kW. Open-Meteo does not require an API key. Never put these values in GitHub or a committed `secrets.toml` file.
 
-The bundled database contains the existing forecast, price, Open-Meteo, AEMO, and Sigen history. Because the GitHub repository is public, anyone who can access the repository can download that database. Without Turso secrets, Community Cloud uses its temporary local copy, so refreshes may be lost after a restart or redeploy. With Turso configured, a restart reloads the last uploaded snapshot; unuploaded refreshes may still be lost.
+The local `solcast_history.sqlite3` database is intentionally excluded from GitHub. Keep a local copy for local development and back it up if its history matters. Streamlit Community Cloud must have both Turso secrets configured; it loads the saved Turso snapshot into a temporary SQLite working copy at startup. Refreshes that are not uploaded to Turso may be lost after a restart or redeploy.
 
 The keys are read from the process environment and sent to Solcast or Amber in HTTPS `Authorization: Bearer` headers. They are not stored in the SQLite database or shown in the dashboard. Do not commit or share API keys.
 

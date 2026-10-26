@@ -48,8 +48,8 @@ os.environ[USE_TURSO_ENV] = "0"
 
 if not has_turso_url and not DATABASE_PATH.is_file():
     st.error(
-        "The bundled solcast_history.sqlite3 database is missing. "
-        "Configure Turso or include it in the GitHub branch used for this deployment."
+        "The local solcast_history.sqlite3 database is missing. "
+        "Configure both Turso secrets for this deployment or provide a local database file."
     )
     st.stop()
 

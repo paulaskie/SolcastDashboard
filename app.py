@@ -3043,20 +3043,40 @@ if not openmeteo_lead_scores.empty:
         st.dataframe(openmeteo_lead_scores, width="stretch", hide_index=True)
         st.caption("Each saved 15-minute forecast interval is scored at its original issue time, grouped by time until the interval starts.")
 
-st.subheader("Solcast vs Open-Meteo forecast power")
-st.caption("Both forecasts are shown in kW for the same Sydney date. Missing Solcast points are filled from the newest earlier saved forecast that has that timestamp.")
-solcast_forecast_dates = set(history["local_date"])
-openmeteo_forecast_date_set = set(openmeteo_forecast_hourly["local_date"]) if not openmeteo_forecast_hourly.empty else set()
-openmeteo_historical_forecast_date_set = (
-    set(openmeteo_historical_forecast_hourly["local_date"])
-    if not openmeteo_historical_forecast_hourly.empty else set()
-)
-forecast_comparison_dates = sorted(
-    solcast_forecast_dates.intersection(
-        openmeteo_forecast_date_set.union(openmeteo_historical_forecast_date_set)
+@st.fragment
+@log_performance
+def render_forecast_comparison(
+    history,
+    latest,
+    openmeteo_forecast_hourly,
+    openmeteo_historical_forecast_hourly,
+    openmeteo_chosen_date,
+):
+    st.subheader("Solcast vs Open-Meteo forecast power")
+    st.caption(
+        "Both forecasts are shown in kW for the same Sydney date. Missing Solcast "
+        "points are filled from the newest earlier saved forecast that has that timestamp."
     )
-)
-if forecast_comparison_dates:
+    solcast_forecast_dates = set(history["local_date"])
+    openmeteo_forecast_date_set = (
+        set(openmeteo_forecast_hourly["local_date"])
+        if not openmeteo_forecast_hourly.empty else set()
+    )
+    openmeteo_historical_forecast_date_set = (
+        set(openmeteo_historical_forecast_hourly["local_date"])
+        if not openmeteo_historical_forecast_hourly.empty else set()
+    )
+    forecast_comparison_dates = sorted(
+        solcast_forecast_dates.intersection(
+            openmeteo_forecast_date_set.union(openmeteo_historical_forecast_date_set)
+        )
+    )
+    if not forecast_comparison_dates:
+        st.info(
+            "No dates are available in both the latest Solcast and Open-Meteo forecasts."
+        )
+        return
+
     comparison_default = (
         openmeteo_chosen_date if openmeteo_chosen_date in forecast_comparison_dates
         else forecast_comparison_dates[-1]
@@ -3066,9 +3086,10 @@ if forecast_comparison_dates:
         min_value=pd.Timestamp(forecast_comparison_dates[0]).date(),
         max_value=pd.Timestamp(forecast_comparison_dates[-1]).date(),
         key="forecast_comparison_date",
+    ).isoformat()
+    solcast_comparison = solcast_comparison_forecast(
+        history, latest, comparison_date,
     )
-    comparison_date = comparison_date.isoformat()
-    solcast_comparison = solcast_comparison_forecast(history, latest, comparison_date)
     openmeteo_comparison_source = (
         openmeteo_historical_forecast_hourly
         if comparison_date in openmeteo_historical_forecast_date_set
@@ -3105,8 +3126,15 @@ if forecast_comparison_dates:
                pd.Timestamp(comparison_date).tz_localize(TZ_NAME) + pd.DateOffset(days=1)]
     )
     st.plotly_chart(comparison_fig, width="stretch")
-else:
-    st.info("No dates are available in both the latest Solcast forecast and Open-Meteo forecast.")
+
+
+render_forecast_comparison(
+    history,
+    latest,
+    openmeteo_forecast_hourly,
+    openmeteo_historical_forecast_hourly,
+    openmeteo_chosen_date,
+)
 
 st.subheader("Non-zero production hours vs daylight duration covered")
 st.caption("For incomplete dates, the daylight bar and Sigen production hours use only recorded five-minute intervals that overlap sunrise-to-sunset.")
