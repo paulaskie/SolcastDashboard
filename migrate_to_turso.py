@@ -8,7 +8,15 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from database import connect_turso, turso_configured
+from database import (
+    SYNC_MANIFEST_TABLE,
+    connect_turso,
+    create_sync_manifest,
+    local_primary_key_columns,
+    sync_row_hash,
+    sync_row_key,
+    turso_configured,
+)
 
 APP_DIR = Path(__file__).resolve().parent
 SOURCE_DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
@@ -45,7 +53,8 @@ def source_digest(path):
 def source_tables(source):
     return source.execute(
         "SELECT name, sql FROM sqlite_master "
-        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+        f"AND name <> '{SYNC_MANIFEST_TABLE}' ORDER BY name"
     ).fetchall()
 
 
@@ -83,8 +92,23 @@ def insert_rows(
     return rows_copied
 
 
+def execute_sql_batches(target, statements):
+    batch = []
+    batch_size = 0
+    for statement in statements:
+        statement_size = len(statement)
+        if batch and batch_size + statement_size > MAX_SCRIPT_SIZE:
+            target.executescript("BEGIN;\n" + "\n".join(batch) + "\nCOMMIT;")
+            batch = []
+            batch_size = 0
+        batch.append(statement)
+        batch_size += statement_size
+    if batch:
+        target.executescript("BEGIN;\n" + "\n".join(batch) + "\nCOMMIT;")
+
+
 def upload_to_turso(source_path, progress_callback=None):
-    """Merge local SQLite rows into Turso, replacing matching keys with local values."""
+    """Upload only local rows that are new or changed since the previous sync."""
     source_path = Path(source_path)
     if not source_path.is_file():
         raise FileNotFoundError(f"SQLite source database not found: {source_path}")
@@ -93,12 +117,29 @@ def upload_to_turso(source_path, progress_callback=None):
 
     rows_uploaded = {}
     with closing(sqlite3.connect(source_path)) as source:
+        create_sync_manifest(source)
         tables = source_tables(source)
         if not tables:
             raise RuntimeError(f"No application tables found in {source_path}.")
 
         target = connect_turso()
         try:
+            create_sync_manifest(target)
+            remote_manifest = {
+                (table_name, row_key): row_hash
+                for table_name, row_key, row_hash in target.execute(
+                    f'SELECT table_name, row_key, row_hash '
+                    f'FROM "{SYNC_MANIFEST_TABLE}"'
+                ).fetchall()
+            }
+            local_manifest = {
+                (table_name, row_key): row_hash
+                for table_name, row_key, row_hash in source.execute(
+                    f'SELECT table_name, row_key, row_hash '
+                    f'FROM "{SYNC_MANIFEST_TABLE}"'
+                ).fetchall()
+            }
+
             for table, create_sql in tables:
                 if not create_sql:
                     continue
@@ -111,26 +152,93 @@ def upload_to_turso(source_path, progress_callback=None):
                 )
                 target.execute(create_sql)
 
+            local_manifest_rows_to_seed = []
+            for table_name, row_key, row_hash in source.execute(
+                f'SELECT table_name, row_key, row_hash '
+                f'FROM "{SYNC_MANIFEST_TABLE}"'
+            ):
+                if (table_name, row_key) not in remote_manifest:
+                    local_manifest_rows_to_seed.append((table_name, row_key, row_hash))
+
+            changed_manifest_rows = []
             for index, (table, _create_sql) in enumerate(tables, start=1):
                 if not _create_sql:
                     continue
-                row_count = insert_rows(
-                    target,
-                    source,
-                    table,
-                    replace_existing=True,
-                    progress_callback=(
-                        (lambda current_table, rows, table_total, current_index=index:
-                            progress_callback(
-                                current_table, rows, table_total, current_index, len(tables),
-                            ))
-                        if progress_callback else None
-                    ),
-                    total_rows=source.execute(
-                        f"SELECT COUNT(*) FROM {quote_identifier(table)}"
-                    ).fetchone()[0],
+                quoted_table = quote_identifier(table)
+                source_cursor = source.execute(f"SELECT * FROM {quoted_table}")
+                source_columns = [
+                    description[0] for description in source_cursor.description or ()
+                ]
+                target_columns = [
+                    description[0]
+                    for description in target.execute(
+                        f"SELECT * FROM {quoted_table} LIMIT 0"
+                    ).description or ()
+                ]
+                shared_columns = [
+                    column for column in source_columns if column in target_columns
+                ]
+                if not shared_columns:
+                    raise RuntimeError(
+                        f"No compatible columns found while uploading Turso table {table}."
+                    )
+                primary_key_columns = local_primary_key_columns(source, table)
+                if not set(primary_key_columns).issubset(shared_columns):
+                    raise RuntimeError(
+                        f"The Turso table {table} is missing one or more primary-key columns."
+                    )
+                column_indexes = [
+                    source_columns.index(column) for column in shared_columns
+                ]
+                quoted_columns = ", ".join(
+                    quote_identifier(column) for column in shared_columns
                 )
-                rows_uploaded[table] = row_count
+                local_baseline = {
+                    row_key: row_hash
+                    for (table_name, row_key), row_hash in local_manifest.items()
+                    if table_name == table
+                }
+                changed_count = 0
+
+                def changed_row_statements():
+                    nonlocal changed_count
+                    for row in source_cursor:
+                        shared_values = tuple(
+                            row[column_index] for column_index in column_indexes
+                        )
+                        row_key = sync_row_key(
+                            primary_key_columns, shared_columns, shared_values,
+                        )
+                        row_hash = sync_row_hash(shared_columns, shared_values)
+                        if local_baseline.get(row_key) == row_hash:
+                            continue
+                        changed_count += 1
+                        changed_manifest_rows.append((table, row_key, row_hash))
+                        values_sql = ", ".join(
+                            sql_literal(value) for value in shared_values
+                        )
+                        yield (
+                            f"INSERT OR REPLACE INTO {quoted_table} ({quoted_columns}) "
+                            f"VALUES ({values_sql});"
+                        )
+
+                execute_sql_batches(target, changed_row_statements())
+                rows_uploaded[table] = changed_count
+                if progress_callback:
+                    progress_callback(
+                        table, changed_count, changed_count, index, len(tables),
+                    )
+
+            manifest_statements = (
+                f'INSERT OR REPLACE INTO "{SYNC_MANIFEST_TABLE}" '
+                f"(table_name, row_key, row_hash) VALUES "
+                f"({sql_literal(table_name)}, {sql_literal(row_key)}, "
+                f"{sql_literal(row_hash)});"
+                for table_name, row_key, row_hash in (
+                    local_manifest_rows_to_seed + changed_manifest_rows
+                )
+            )
+            execute_sql_batches(target, manifest_statements)
 
             indexes = source.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
@@ -145,6 +253,13 @@ def upload_to_turso(source_path, progress_callback=None):
                 )
                 target.execute(create_sql)
             target.commit()
+
+            source.executemany(
+                f'INSERT OR REPLACE INTO "{SYNC_MANIFEST_TABLE}" '
+                "(table_name, row_key, row_hash) VALUES (?, ?, ?)",
+                local_manifest_rows_to_seed + changed_manifest_rows,
+            )
+            source.commit()
         finally:
             target.close()
     return rows_uploaded

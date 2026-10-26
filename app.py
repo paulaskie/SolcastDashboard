@@ -1037,12 +1037,12 @@ with st.sidebar:
     if turso_configured() and not turso_enabled():
         with st.expander("Database sync"):
             st.caption(
-                "Cloud loads a Turso snapshot into local SQLite at startup. Refreshes stay "
-                "local until upload; matching Turso records are replaced and Turso-only "
-                "records are retained."
+                "Upload only new or changed SQLite rows to Turso. Unchanged rows are skipped; "
+                "matching Turso rows are replaced and Turso-only records are retained. "
+                "A local database without a sync baseline needs one full initial upload."
             )
             upload_confirmed = st.checkbox(
-                "I understand local values replace matching Turso records",
+                "I understand changed local values replace matching Turso records",
                 key="confirm_local_turso_upload",
             )
             upload_local_turso_clicked = st.button(
@@ -1067,10 +1067,14 @@ if upload_local_turso_clicked:
         with st.spinner("Uploading local database to Turso…"):
             uploaded_rows = upload_to_turso(DB_PATH, report_upload_progress)
         upload_progress.progress(1.0, text="Upload complete")
-        st.success(
-            f"Uploaded {sum(uploaded_rows.values()):,} rows across "
-            f"{len(uploaded_rows)} tables to Turso."
-        )
+        uploaded_count = sum(uploaded_rows.values())
+        if uploaded_count:
+            st.success(
+                f"Uploaded {uploaded_count:,} new or changed rows across "
+                f"{len(uploaded_rows)} tables to Turso."
+            )
+        else:
+            st.success("Turso is up to date; no new or changed rows needed uploading.")
     except Exception as error:
         st.error(f"Could not upload local database to Turso: {error}")
 
