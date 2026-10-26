@@ -5,6 +5,7 @@ import runpy
 from pathlib import Path
 
 import streamlit as st
+from database import USE_TURSO_ENV
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -41,6 +42,8 @@ if has_turso_url != has_turso_token:
         "to use the bundled database."
     )
     st.stop()
+
+os.environ[USE_TURSO_ENV] = "1" if has_turso_url else "0"
 
 if not has_turso_url and not DATABASE_PATH.is_file():
     st.error(

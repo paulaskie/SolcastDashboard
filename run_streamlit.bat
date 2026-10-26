@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+set "SOLCAST_USE_TURSO=0"
 
 if not exist ".venv\Scripts\python.exe" (
     py -3 -m venv .venv
@@ -8,6 +9,12 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 if not exist ".venv\Scripts\streamlit.exe" (
+    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+    if errorlevel 1 goto setup_failed
+)
+
+".venv\Scripts\python.exe" -c "import turso_serverless" >nul 2>&1
+if errorlevel 1 (
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt
     if errorlevel 1 goto setup_failed
 )

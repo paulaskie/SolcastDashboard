@@ -8,7 +8,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from database import connect_database, turso_configured
+from database import connect_turso, turso_configured
 
 APP_DIR = Path(__file__).resolve().parent
 SOURCE_DB_PATH = Path(os.getenv("SOLCAST_DB_PATH", str(APP_DIR / "solcast_history.sqlite3")))
@@ -49,11 +49,14 @@ def source_tables(source):
     ).fetchall()
 
 
-def insert_rows(target, source, table):
+def insert_rows(
+    target, source, table, replace_existing=False, progress_callback=None, total_rows=0,
+):
     quoted_table = quote_identifier(table)
     cursor = source.execute(f"SELECT * FROM {quoted_table}")
     columns = [description[0] for description in cursor.description]
     quoted_columns = ", ".join(quote_identifier(column) for column in columns)
+    conflict_action = "REPLACE" if replace_existing else "IGNORE"
     rows_copied = 0
     batch = []
     batch_size = 0
@@ -61,7 +64,8 @@ def insert_rows(target, source, table):
     for row in cursor:
         values = ", ".join(sql_literal(value) for value in row)
         batch.append(
-            f"INSERT OR IGNORE INTO {quoted_table} ({quoted_columns}) VALUES ({values});"
+            f"INSERT OR {conflict_action} INTO {quoted_table} ({quoted_columns}) "
+            f"VALUES ({values});"
         )
         batch_size += len(batch[-1])
         rows_copied += 1
@@ -69,10 +73,81 @@ def insert_rows(target, source, table):
             target.executescript("BEGIN;\n" + "\n".join(batch) + "\nCOMMIT;")
             batch.clear()
             batch_size = 0
+            if progress_callback:
+                progress_callback(table, rows_copied, total_rows)
 
     if batch:
         target.executescript("BEGIN;\n" + "\n".join(batch) + "\nCOMMIT;")
+    if progress_callback:
+        progress_callback(table, rows_copied, total_rows)
     return rows_copied
+
+
+def upload_to_turso(source_path, progress_callback=None):
+    """Merge local SQLite rows into Turso, replacing matching keys with local values."""
+    source_path = Path(source_path)
+    if not source_path.is_file():
+        raise FileNotFoundError(f"SQLite source database not found: {source_path}")
+    if not turso_configured():
+        raise RuntimeError("Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN before uploading.")
+
+    rows_uploaded = {}
+    with closing(sqlite3.connect(source_path)) as source:
+        tables = source_tables(source)
+        if not tables:
+            raise RuntimeError(f"No application tables found in {source_path}.")
+
+        target = connect_turso()
+        try:
+            for table, create_sql in tables:
+                if not create_sql:
+                    continue
+                create_sql = re.sub(
+                    r"^CREATE TABLE\s+",
+                    "CREATE TABLE IF NOT EXISTS ",
+                    create_sql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                target.execute(create_sql)
+
+            for index, (table, _create_sql) in enumerate(tables, start=1):
+                if not _create_sql:
+                    continue
+                row_count = insert_rows(
+                    target,
+                    source,
+                    table,
+                    replace_existing=True,
+                    progress_callback=(
+                        (lambda current_table, rows, table_total, current_index=index:
+                            progress_callback(
+                                current_table, rows, table_total, current_index, len(tables),
+                            ))
+                        if progress_callback else None
+                    ),
+                    total_rows=source.execute(
+                        f"SELECT COUNT(*) FROM {quote_identifier(table)}"
+                    ).fetchone()[0],
+                )
+                rows_uploaded[table] = row_count
+
+            indexes = source.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+            ).fetchall()
+            for (create_sql,) in indexes:
+                create_sql = re.sub(
+                    r"^CREATE (UNIQUE )?INDEX\s+",
+                    r"CREATE \1INDEX IF NOT EXISTS ",
+                    create_sql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                target.execute(create_sql)
+            target.commit()
+        finally:
+            target.close()
+    return rows_uploaded
 
 
 def migrate():
@@ -89,7 +164,7 @@ def migrate():
         if not tables:
             raise RuntimeError(f"No application tables found in {SOURCE_DB_PATH}.")
 
-        target = connect_database(SOURCE_DB_PATH)
+        target = connect_turso()
         try:
             target.execute(f"""
                 CREATE TABLE IF NOT EXISTS {quote_identifier(MIGRATION_TABLE)} (

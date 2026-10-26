@@ -6,7 +6,13 @@ import math
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 
-from database import DB_OPERATIONAL_ERRORS, connect_database, read_sql_query
+from database import (
+    DB_OPERATIONAL_ERRORS,
+    connect_database,
+    read_sql_query,
+    turso_configured,
+    turso_enabled,
+)
 
 import pandas as pd
 import numpy as np
@@ -39,8 +45,9 @@ OPENMETEO_CALIBRATION_DATE = "2026-10-09"
 
 st.set_page_config(page_title="Solar Forecast", page_icon="☀️", layout="wide")
 
-def connect_db():
-    conn = connect_database(DB_PATH)
+@st.cache_resource
+def _initialize_db(database_path, database_url):
+    conn = connect_database(database_path)
     table_renames = (
         ("forecast_intervals", "solcast_forecast_30min"),
         ("actual_intervals", "solcast_estimate_30min"),
@@ -166,7 +173,12 @@ def connect_db():
             except (TypeError, ValueError):
                 pass
     conn.commit()
-    return conn
+    conn.close()
+
+
+def connect_db():
+    _initialize_db(str(DB_PATH), os.getenv("TURSO_DATABASE_URL", "").strip())
+    return connect_database(DB_PATH)
 
 def date_picker_with_arrows(label, value, key, min_value=None, max_value=None):
     """Render a calendar picker with previous-day and next-day arrows."""
@@ -899,10 +911,11 @@ def extract_battery_soc(raw_json):
 st.title("☀️ Solar Forecast Dashboard")
 st.caption("Rooftop PV forecast · Daily energy estimates in Australia/Sydney time")
 
+upload_local_turso_clicked = False
 with st.sidebar:
     st.header("Controls")
     database_label = (
-        "Turso Cloud" if os.getenv("TURSO_DATABASE_URL", "").strip()
+        "Turso Cloud" if turso_enabled()
         else f"Local database · {DB_PATH.name}"
     )
     st.caption(database_label)
@@ -979,6 +992,45 @@ with st.sidebar:
             disabled=not bool(amber_api_key),
             help="Fetches actual intervals from the latest saved CurrentInterval through now.",
         )
+
+    if turso_configured() and not turso_enabled():
+        with st.expander("Database sync"):
+            st.caption(
+                "Upload local SQLite data to Turso. Local rows replace matching records; "
+                "Turso-only records are retained."
+            )
+            upload_confirmed = st.checkbox(
+                "I understand local values replace matching Turso records",
+                key="confirm_local_turso_upload",
+            )
+            upload_local_turso_clicked = st.button(
+                "Upload local database to Turso",
+                width="stretch",
+                disabled=not upload_confirmed,
+            )
+
+if upload_local_turso_clicked:
+    try:
+        from migrate_to_turso import upload_to_turso
+
+        upload_progress = st.progress(0, text="Preparing local database upload…")
+
+        def report_upload_progress(table, rows, table_total, table_index, table_count):
+            fraction = (table_index - 1 + rows / max(table_total, 1)) / table_count
+            upload_progress.progress(
+                min(fraction, 1.0),
+                text=f"Uploading {table}: {rows:,} of {table_total:,} rows",
+            )
+
+        with st.spinner("Uploading local database to Turso…"):
+            uploaded_rows = upload_to_turso(DB_PATH, report_upload_progress)
+        upload_progress.progress(1.0, text="Upload complete")
+        st.success(
+            f"Uploaded {sum(uploaded_rows.values()):,} rows across "
+            f"{len(uploaded_rows)} tables to Turso."
+        )
+    except Exception as error:
+        st.error(f"Could not upload local database to Turso: {error}")
 
 if openmeteo_refresh_clicked:
     try:
