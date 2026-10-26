@@ -1,6 +1,7 @@
 """Database connection helpers for local SQLite and Turso Cloud."""
 
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -38,6 +39,91 @@ def connect_database(database_path):
     if turso_enabled():
         return connect_turso()
     return sqlite3.connect(Path(database_path))
+
+
+def pull_turso_snapshot(database_path):
+    """Replace matching local application tables with a one-time Turso snapshot."""
+    database_path = Path(database_path)
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    remote = connect_turso()
+    local = None
+    try:
+        local = sqlite3.connect(database_path)
+        local.execute("BEGIN")
+        tables = remote.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+            "AND name <> '_dashboard_migrations' ORDER BY name"
+        ).fetchall()
+        if not tables:
+            raise RuntimeError("The Turso database does not contain dashboard tables.")
+
+        row_counts = {}
+        for table_name, create_sql in tables:
+            quoted_table = '"' + table_name.replace('"', '""') + '"'
+            if not create_sql:
+                continue
+            create_sql = re.sub(
+                r"^CREATE TABLE\s+",
+                "CREATE TABLE IF NOT EXISTS ",
+                create_sql,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            local.execute(create_sql)
+            remote_cursor = remote.execute(f"SELECT * FROM {quoted_table}")
+            remote_columns = [
+                description[0] for description in remote_cursor.description or ()
+            ]
+            local_columns = {
+                row[1] for row in local.execute(f"PRAGMA table_info({quoted_table})")
+            }
+            shared_columns = [
+                column for column in remote_columns if column in local_columns
+            ]
+            if not shared_columns:
+                raise RuntimeError(
+                    f"No compatible columns found while loading Turso table {table_name}."
+                )
+            remote_rows = remote_cursor.fetchall()
+            column_indexes = [remote_columns.index(column) for column in shared_columns]
+            quoted_columns = ", ".join(
+                '"' + column.replace('"', '""') + '"' for column in shared_columns
+            )
+            placeholders = ", ".join("?" for _ in shared_columns)
+            local.execute(f"DELETE FROM {quoted_table}")
+            local.executemany(
+                f"INSERT OR REPLACE INTO {quoted_table} ({quoted_columns}) "
+                f"VALUES ({placeholders})",
+                (
+                    tuple(row[index] for index in column_indexes)
+                    for row in remote_rows
+                ),
+            )
+            row_counts[table_name] = len(remote_rows)
+
+        indexes = remote.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+        ).fetchall()
+        for (create_sql,) in indexes:
+            create_sql = re.sub(
+                r"^CREATE (UNIQUE )?INDEX\s+",
+                r"CREATE \1INDEX IF NOT EXISTS ",
+                create_sql,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            local.execute(create_sql)
+        local.commit()
+        return row_counts
+    except Exception:
+        if local is not None:
+            local.rollback()
+        raise
+    finally:
+        if local is not None:
+            local.close()
+        remote.close()
 
 
 def read_sql_query(query, connection, params=None):

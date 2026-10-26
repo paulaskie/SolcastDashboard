@@ -996,8 +996,9 @@ with st.sidebar:
     if turso_configured() and not turso_enabled():
         with st.expander("Database sync"):
             st.caption(
-                "Upload local SQLite data to Turso. Local rows replace matching records; "
-                "Turso-only records are retained."
+                "Cloud loads a Turso snapshot into local SQLite at startup. Refreshes stay "
+                "local until upload; matching Turso records are replaced and Turso-only "
+                "records are retained."
             )
             upload_confirmed = st.checkbox(
                 "I understand local values replace matching Turso records",

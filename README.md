@@ -94,7 +94,7 @@ TURSO_DATABASE_URL = "your-database-url"
 TURSO_AUTH_TOKEN = "your-database-auth-token"
 ```
 
-Streamlit Community Cloud automatically selects Turso when both values are set. Local runs use SQLite by default for faster access, even if Turso credentials are present in the environment. To deliberately use Turso from a local PowerShell session, set `$env:SOLCAST_USE_TURSO = "1"` before starting the app. Set both credentials; a partial configuration is reported as an error. Keep the auth token private.
+On Streamlit Community Cloud, the app downloads a Turso snapshot into its local SQLite working copy once per app process. Dashboard reads and refreshes then use SQLite; changes are sent to Turso only when **Upload local database to Turso** is pressed and confirmed. A restart loads a fresh snapshot. Local runs use SQLite by default for faster access, even if Turso credentials are present in the environment. To deliberately use Turso directly from a local PowerShell session, set `$env:SOLCAST_USE_TURSO = "1"` before starting the app. Set both credentials; a partial configuration is reported as an error. Keep the auth token private.
 
 To copy the bundled history to a new, empty Turso database before deployment, run the migration utility locally in PowerShell. Set the URL and token in your current PowerShell session (do not commit them), then run:
 
@@ -104,7 +104,7 @@ $env:TURSO_AUTH_TOKEN = "your-database-auth-token"
 python migrate_to_turso.py
 ```
 
-The migration copies the bundled tables and records and can resume after an interrupted run. It refuses to mix the bundled history into a Turso database that already contains application data. If you skip migration, the app initializes its tables on Turso, but existing bundled history is not copied. Once configured, Streamlit Cloud reads and writes refreshed data directly to Turso rather than its temporary local copy.
+The migration copies the bundled tables and records and can resume after an interrupted run. It refuses to mix the bundled history into a Turso database that already contains application data. If you skip migration, existing bundled history is not initially copied to Turso; the Cloud app loads whatever tables and records are already there, then keeps its working changes in SQLite until upload.
 
 For local performance, run `run_streamlit.bat` without `SOLCAST_USE_TURSO`; it uses the bundled SQLite database. Local refreshes then update only that SQLite copy, not Turso. To upload local changes, set the Turso credentials in the PowerShell session before starting the app:
 
@@ -114,11 +114,11 @@ $env:TURSO_AUTH_TOKEN = "your-database-auth-token"
 .\run_streamlit.bat
 ```
 
-Then use **Database sync → Upload local database to Turso** and confirm before uploading. Local rows replace matching records in Turso; Turso-only rows remain, and rows are not deleted. To use Turso directly for local reads and writes instead, opt in with `$env:SOLCAST_USE_TURSO = "1"`; expect database operations to depend on network latency.
+Then use **Database sync → Upload local database to Turso** and confirm before uploading. Local rows replace matching records in Turso; Turso-only rows remain, and rows are not deleted. Cloud dashboard refreshes follow the same local-first pattern and do not write to Turso until that upload is confirmed. To use Turso directly for local reads and writes instead, opt in with `$env:SOLCAST_USE_TURSO = "1"`; expect database operations to depend on network latency.
 
 `SOLCAST_API_KEY` enables Solcast forecast and estimated-actual downloads. `AMBER_API_KEY` enables Amber price updates. `SIGEN_EXPORT_LIMIT_KW` is an optional site export-limit assumption used by the battery-sale estimate; it defaults to `10` kW. Open-Meteo does not require an API key. Never put these values in GitHub or a committed `secrets.toml` file.
 
-The bundled database contains the existing forecast, price, Open-Meteo, AEMO, and Sigen history. Because the GitHub repository is public, anyone who can access the repository can download that database. Without Turso secrets, Community Cloud uses its temporary local copy, so refreshes may be lost after a restart or redeploy.
+The bundled database contains the existing forecast, price, Open-Meteo, AEMO, and Sigen history. Because the GitHub repository is public, anyone who can access the repository can download that database. Without Turso secrets, Community Cloud uses its temporary local copy, so refreshes may be lost after a restart or redeploy. With Turso configured, a restart reloads the last uploaded snapshot; unuploaded refreshes may still be lost.
 
 The keys are read from the process environment and sent to Solcast or Amber in HTTPS `Authorization: Bearer` headers. They are not stored in the SQLite database or shown in the dashboard. Do not commit or share API keys.
 

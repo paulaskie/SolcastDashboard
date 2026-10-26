@@ -43,7 +43,7 @@ if has_turso_url != has_turso_token:
     )
     st.stop()
 
-os.environ[USE_TURSO_ENV] = "1" if has_turso_url else "0"
+os.environ[USE_TURSO_ENV] = "0"
 
 if not has_turso_url and not DATABASE_PATH.is_file():
     st.error(
@@ -53,4 +53,18 @@ if not has_turso_url and not DATABASE_PATH.is_file():
     st.stop()
 
 os.environ["SOLCAST_DB_PATH"] = str(DATABASE_PATH)
+
+if has_turso_url:
+    @st.cache_resource
+    def _load_turso_snapshot(database_path, database_url):
+        from database import pull_turso_snapshot
+
+        return pull_turso_snapshot(database_path)
+
+    try:
+        _load_turso_snapshot(str(DATABASE_PATH), os.getenv("TURSO_DATABASE_URL", "").strip())
+    except Exception as error:
+        st.error(f"Could not load the Turso database snapshot: {error}")
+        st.stop()
+
 runpy.run_path(str(APP_DIR / "app.py"), run_name="__main__")
