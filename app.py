@@ -1274,371 +1274,48 @@ openmeteo_historical_forecast_hourly = apply_openmeteo_performance_ratio(
 )
 openmeteo_daily = load_openmeteo_daily()
 amber_prices = load_amber_prices()
-scenario_default_date = pd.Timestamp.now(tz=TZ_NAME).date()
-scenario_start_date = st.session_state.get(
-    "battery_soc_scenario_start_date_v2", scenario_default_date,
-)
-scenario_start_time = st.session_state.get(
-    "battery_soc_scenario_start_time_v2", dt_time(18, 0),
-)
-scenario_end_date = st.session_state.get(
-    "battery_soc_scenario_end_date_v2", scenario_default_date,
-)
-scenario_end_time = st.session_state.get(
-    "battery_soc_scenario_end_time_v2", dt_time(19, 0),
-)
-scenario_second_enabled = st.session_state.get(
-    "battery_soc_scenario_second_enabled", False,
-)
-scenario_second_start_date = st.session_state.get(
-    "battery_soc_scenario_second_start_date", scenario_default_date,
-)
-scenario_second_start_time = st.session_state.get(
-    "battery_soc_scenario_second_start_time", dt_time(20, 0),
-)
-scenario_second_end_date = st.session_state.get(
-    "battery_soc_scenario_second_end_date", scenario_default_date,
-)
-scenario_second_end_time = st.session_state.get(
-    "battery_soc_scenario_second_end_time", dt_time(21, 0),
-)
-scenario_start = pd.Timestamp(datetime.combine(
-    scenario_start_date, scenario_start_time,
-)).tz_localize(TZ_NAME)
-scenario_end = pd.Timestamp(datetime.combine(
-    scenario_end_date, scenario_end_time,
-)).tz_localize(TZ_NAME)
-scenario_periods = [(scenario_start, scenario_end)]
-if scenario_second_enabled:
-    scenario_periods.append((
-        pd.Timestamp(datetime.combine(
-            scenario_second_start_date, scenario_second_start_time,
-        )).tz_localize(TZ_NAME),
-        pd.Timestamp(datetime.combine(
-            scenario_second_end_date, scenario_second_end_time,
-        )).tz_localize(TZ_NAME),
-    ))
-scenario_periods = merge_time_windows(scenario_periods)
-st.subheader("Amber electricity price over time")
-if amber_prices.empty:
-    st.info("No Amber prices are saved yet. Set AMBER_API_KEY and choose **Fetch Amber prices** in the sidebar.")
-else:
-    amber_prices["local_date"] = amber_prices["start_time_local"].dt.date.astype(str)
-    price_dates = sorted(pd.to_datetime(amber_prices["local_date"]).dt.date.unique())
-    amber_default = amber_date if amber_date in price_dates else price_dates[-1]
-    amber_date_col, amber_channel_col = st.columns(2)
-    with amber_date_col:
-        amber_chosen_date = date_picker_with_arrows(
-            "Price date (Sydney)", value=amber_default,
-            min_value=price_dates[0], max_value=price_dates[-1], key="amber_price_date_picker",
-        )
-    with amber_channel_col:
-        available_channels = list(dict.fromkeys(amber_prices["channel_type"].dropna().astype(str)))
-        default_channels = [channel for channel in ("feedIn", "general") if channel in available_channels]
-        selected_channels = st.multiselect(
-            "Channels", available_channels,
-            default=default_channels or available_channels,
-            key="amber_price_channels",
-        )
-    amber_intraday = amber_prices[amber_prices["local_date"] == amber_chosen_date.isoformat()].copy()
-    amber_intraday = amber_intraday[
-        amber_intraday["channel_type"].isin(selected_channels)
-        & amber_intraday["per_kwh"].notna()
-        & amber_intraday["price_type"].str.lower().isin(
-            ("actualinterval", "currentinterval", "forecastinterval")
-        )
-    ].copy()
-    amber_intraday["_start_utc"] = pd.to_datetime(amber_intraday["start_time_utc"], utc=True)
-    amber_intraday["_end_utc"] = pd.to_datetime(amber_intraday["end_time_utc"], utc=True)
-    actual_like = amber_intraday[
-        amber_intraday["price_type"].str.lower().isin(("actualinterval", "currentinterval"))
-    ].copy()
-    actual_like["_priority"] = actual_like["price_type"].str.lower().map(
-        {"actualinterval": 0, "currentinterval": 1}
+
+
+@st.fragment
+@log_performance
+def _render_amber_and_battery_panels():
+    scenario_default_date = pd.Timestamp.now(tz=TZ_NAME).date()
+    scenario_start_date = st.session_state.get(
+        "battery_soc_scenario_start_date_v2", scenario_default_date,
     )
-    actual_like["_source_duration_minutes"] = (
-        (actual_like["_end_utc"] - actual_like["_start_utc"]).dt.total_seconds() / 60
-    ).round().astype(int)
-    actual_like = (actual_like.sort_values(
-        ["_priority", "_source_duration_minutes", "fetched_at_utc"],
-        ascending=[True, True, False],
-    ).drop_duplicates(["channel_type", "start_time_utc"], keep="first"))
-    forecast = amber_intraday[amber_intraday["price_type"].str.lower() == "forecastinterval"].copy()
-    forecast["_source_duration_minutes"] = (
-        (forecast["_end_utc"] - forecast["_start_utc"]).dt.total_seconds() / 60
-    ).round().astype(int)
-    if amber_chosen_date < pd.Timestamp.now(tz=TZ_NAME).date():
-        # Historical days should show finalized prices, never stale forecasts.
-        forecast = forecast.iloc[0:0].copy()
-    forecast = (forecast.sort_values(
-        ["fetched_at_utc", "_source_duration_minutes"], ascending=[False, True],
-    ).drop_duplicates(["channel_type", "start_time_utc", "end_time_utc"], keep="first"))
-    intervals = pd.concat([actual_like, forecast], ignore_index=True, sort=False)
-    # Expand any longer Amber source interval to 5-minute buckets, then retain
-    # one row per bucket: actual, current, then shortest/latest forecast.
-    bucket_rows = []
-    for _, source_row in intervals.iterrows():
-        bucket_start = source_row["_start_utc"].floor("5min")
-        while bucket_start < source_row["_end_utc"]:
-            bucket = source_row.copy()
-            bucket["_bucket_start_utc"] = bucket_start
-            bucket_rows.append(bucket)
-            bucket_start += pd.Timedelta(minutes=5)
-    amber_intraday = pd.DataFrame(bucket_rows) if bucket_rows else intervals.iloc[0:0].copy()
-    if not amber_intraday.empty:
-        # A forecast can come from an earlier snapshot and extend back to midnight.
-        # Once actual/current prices cover those buckets, only show the dotted
-        # forecast after the latest observed bucket for that channel.
-        latest_observed_bucket = (
-            actual_like.assign(
-                _bucket_start_utc=actual_like["_start_utc"].dt.floor("5min"),
-            )
-            .groupby("channel_type")["_bucket_start_utc"]
-            .max()
-            .to_dict()
-        )
-        if latest_observed_bucket:
-            observed_cutoff = amber_intraday["channel_type"].map(latest_observed_bucket)
-            stale_forecast = (
-                amber_intraday["price_type"].str.lower().eq("forecastinterval")
-                & observed_cutoff.notna()
-                & (amber_intraday["_bucket_start_utc"] <= observed_cutoff)
-            )
-            amber_intraday = amber_intraday[~stale_forecast].copy()
-        amber_intraday["_priority"] = amber_intraday["price_type"].str.lower().map(
-            {"actualinterval": 0, "currentinterval": 1, "forecastinterval": 2}
-        )
-        amber_intraday = (amber_intraday.sort_values(
-            ["_priority", "_source_duration_minutes", "fetched_at_utc"],
-            ascending=[True, True, False],
-        ).drop_duplicates(["channel_type", "_bucket_start_utc"], keep="first"))
-        amber_intraday["start_time_local"] = amber_intraday["_bucket_start_utc"].dt.tz_convert(TZ_NAME)
-        amber_intraday = amber_intraday.sort_values("start_time_local")
-    chart_prices = amber_intraday["per_kwh"].astype(float).where(
-        amber_intraday["channel_type"] != "feedIn", -amber_intraday["per_kwh"].astype(float)
-    ).dropna()
-    use_log_axis = not chart_prices.empty and chart_prices.abs().max() > 100
-    # Use the symmetric-log transform for large prices so a zero tick can
-    # always be shown, including when every selected price is positive.
-    use_symmetric_log = use_log_axis
-
-    def symmetric_log(value):
-        return np.sign(value) * np.log10(1 + np.abs(value))
-
-    price_fig = go.Figure()
-    channel_colors = {"general": "#2ca02c", "feedIn": "#f1c40f", "controlledLoad": "#9467bd"}
-    for channel_type, channel_prices in amber_intraday.groupby("channel_type", sort=False):
-        channel_prices = channel_prices.sort_values("start_time_local")
-        actual_prices = channel_prices[channel_prices["price_type"].str.lower() != "forecastinterval"]
-        forecast_prices = channel_prices[channel_prices["price_type"].str.lower() == "forecastinterval"]
-        line_color = channel_colors.get(channel_type)
-
-        def add_amber_price_trace(price_series, dash, showlegend, name):
-            if price_series.empty:
-                return
-            plotted_price = -price_series["per_kwh"] if channel_type == "feedIn" else price_series["per_kwh"]
-            source_resolution = price_series["_source_duration_minutes"].astype(str) + " min source interval"
-            plotted_y = symmetric_log(plotted_price) if use_symmetric_log else plotted_price
-            price_fig.add_trace(go.Scatter(
-                x=price_series["start_time_local"], y=plotted_y,
-                mode="lines", connectgaps=False,
-                name=name, showlegend=showlegend,
-                line=dict(color=line_color, dash=dash),
-                customdata=list(zip(
-                    plotted_price.to_numpy(), source_resolution.to_numpy(),
-                    price_series["price_type"].to_numpy(),
-                )),
-                hovertemplate="%{x|%H:%M}<br>Price: %{customdata[0]:.3f} ¢/kWh"
-                              "<br>Amber type: %{customdata[2]}<br>%{customdata[1]}<extra></extra>",
-            ))
-
-        legend_name = f"Amber · {channel_type} (¢/kWh)"
-        if actual_prices.empty:
-            # Keep a solid channel key in the legend even on forecast-only dates.
-            price_fig.add_trace(go.Scatter(
-                x=[None], y=[None], mode="lines", name=legend_name,
-                line=dict(color=line_color),
-            ))
-        else:
-            add_amber_price_trace(actual_prices, "solid", True, legend_name)
-        add_amber_price_trace(forecast_prices, "dot", False, legend_name)
-    if use_symmetric_log:
-        price_limit = float(chart_prices.abs().max())
-        max_exponent = max(0, math.ceil(math.log10(price_limit)))
-        tick_prices = {0.0}
-        for exponent in range(max_exponent + 1):
-            decade = 10 ** exponent
-            tick_prices.update(value * decade for value in (1, 2, 5) if value * decade <= price_limit)
-        symmetric_ticks = sorted({
-            tick for value in tick_prices for tick in (-value, value)
-            if chart_prices.min() <= tick <= chart_prices.max()
-        } | {0.0})
-        axis_config = dict(
-            type="linear", title="Price (¢/kWh, symmetric log)", tickmode="array",
-            tickvals=[float(symmetric_log(value)) for value in symmetric_ticks],
-            ticktext=[f"{value:g}" for value in symmetric_ticks],
-            range=[
-                float(symmetric_log(min(0.0, chart_prices.min()))),
-                float(symmetric_log(max(0.0, chart_prices.max()))),
-            ],
-        )
-    else:
-        axis_config = dict(title="Price (¢/kWh)", rangemode="tozero")
-    price_fig.update_layout(xaxis_title="Time (Sydney)", yaxis=axis_config,
-                            margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
-    chart_day_start = pd.Timestamp(amber_chosen_date).tz_localize(TZ_NAME)
-    chart_day_end = chart_day_start + pd.DateOffset(days=1)
-    price_fig.update_xaxes(range=[chart_day_start, chart_day_end])
-    for scenario_window_start, scenario_window_end in scenario_periods:
-        scenario_window_start = max(scenario_window_start, chart_day_start)
-        scenario_window_end = min(scenario_window_end, chart_day_end)
-        if scenario_window_start < scenario_window_end:
-            price_fig.add_shape(
-                type="rect", xref="x", yref="paper",
-                x0=scenario_window_start, x1=scenario_window_end,
-                y0=0, y1=1, layer="below",
-                fillcolor="rgba(128,128,128,0.2)", line=dict(width=0),
-            )
-    place_legend_below_chart(price_fig)
-    st.plotly_chart(price_fig, width="stretch")
-
-st.subheader("Sigen battery state of charge")
-battery_soc = (
-    energy_actuals.dropna(subset=["Battery state of charge (%)"])
-    if not energy_actuals.empty else pd.DataFrame()
-)
-if battery_soc.empty:
-    st.info("No battery state-of-charge values were found in sigen_energy_actuals.battery_soc.")
-else:
-    battery_soc_dates = sorted(battery_soc["local_date"].unique())
-    battery_soc_default = battery_soc_dates[-1]
-    forecast_date_candidates = []
-    if not history.empty and "local_date" in history:
-        forecast_date_candidates.extend(history["local_date"].dropna().astype(str).tolist())
-    if not openmeteo_forecast_hourly.empty and "local_date" in openmeteo_forecast_hourly:
-        forecast_date_candidates.extend(
-            openmeteo_forecast_hourly["local_date"].dropna().astype(str).tolist()
-        )
-    latest_selectable_date = max([*battery_soc_dates, *forecast_date_candidates])
-    battery_soc_date = half_width_date_picker_with_arrows(
-        "Battery SOC date", pd.Timestamp(battery_soc_default).date(),
-        min_value=pd.Timestamp(battery_soc_dates[0]).date(),
-        max_value=pd.Timestamp(latest_selectable_date).date(),
-        key="sigen_battery_soc_date",
-    ).isoformat()
-    latest_soc = battery_soc.sort_values("period_end_local").iloc[-1]
-    latest_soc_time = pd.Timestamp(latest_soc["period_end_local"])
-    load_samples = energy_actuals[
-        energy_actuals["load_power_kw"].notna()
-        & (energy_actuals["period_end_local"] <= latest_soc_time)
-        & (energy_actuals["period_end_local"] > latest_soc_time - pd.Timedelta(days=7))
-    ].copy()
-    if not load_samples.empty:
-        load_samples["slot_end"] = load_samples["period_end_local"].dt.ceil("30min")
-        load_samples["slot"] = load_samples["slot_end"].dt.strftime("%H:%M")
-        load_profile = load_samples.groupby("slot")["load_power_kw"].mean()
-        average_load_kw = float(load_samples["load_power_kw"].mean())
-    else:
-        load_profile = pd.Series(dtype=float)
-        average_load_kw = 0.0
-    scenario_generation = pd.DataFrame(columns=["time_local", "solcast_kw", "openmeteo_kw"])
-    if not history.empty and not openmeteo_forecast_hourly.empty:
-        solcast_projection = history.dropna(subset=["pv_estimate"]).copy()
-        solcast_projection = (
-            solcast_projection.sort_values("downloaded_at_utc", ascending=False)
-            .drop_duplicates("period_end_utc", keep="first")
-        )
-        solcast_projection = solcast_projection[
-            solcast_projection["period_end_utc"] > latest_soc_time.tz_convert("UTC")
-        ][["period_end_local", "pv_estimate"]].rename(
-            columns={"period_end_local": "time_local", "pv_estimate": "solcast_kw"}
-        )
-        openmeteo_projection = openmeteo_forecast_hourly[
-            ["time_local", "openmeteo_power_kw"]
-        ].dropna().copy()
-        openmeteo_projection["time_local"] = pd.to_datetime(openmeteo_projection["time_local"])
-        openmeteo_projection["time_local"] = (
-            openmeteo_projection["time_local"].dt.floor("30min")
-            + pd.Timedelta(minutes=30)
-        )
-        openmeteo_projection = openmeteo_projection.groupby("time_local", as_index=False).agg(
-            openmeteo_kw=("openmeteo_power_kw", "mean"),
-        )
-        scenario_generation = solcast_projection.merge(
-            openmeteo_projection, on="time_local", how="inner",
-        ).sort_values("time_local")
-    scenario_current_date = pd.Timestamp.now(tz=TZ_NAME).date()
-    scenario_cols = st.columns([1, 1, 1, 1])
-    with scenario_cols[0]:
-        scenario_start_date = st.date_input(
-            "Sell from date", value=scenario_current_date,
-            key="battery_soc_scenario_start_date_v2",
-        )
-    with scenario_cols[1]:
-        scenario_start_time = st.time_input(
-            "Sell from time", value=dt_time(18, 0),
-            key="battery_soc_scenario_start_time_v2",
-        )
-    with scenario_cols[2]:
-        scenario_end_date = st.date_input(
-            "Sell until date", value=scenario_current_date,
-            key="battery_soc_scenario_end_date_v2",
-        )
-    with scenario_cols[3]:
-        scenario_end_time = st.time_input(
-            "Sell until time", value=dt_time(19, 0),
-            key="battery_soc_scenario_end_time_v2",
-        )
-    scenario_target_placeholders = {0: st.empty()}
-    scenario_second_enabled = st.checkbox(
-        "Add a second sell period", key="battery_soc_scenario_second_enabled",
+    scenario_start_time = st.session_state.get(
+        "battery_soc_scenario_start_time_v2", dt_time(18, 0),
     )
-    if scenario_second_enabled:
-        scenario_second_cols = st.columns([1, 1, 1, 1])
-        with scenario_second_cols[0]:
-            scenario_second_start_date = st.date_input(
-                "Second sell from date", value=scenario_current_date,
-                key="battery_soc_scenario_second_start_date",
-            )
-        with scenario_second_cols[1]:
-            scenario_second_start_time = st.time_input(
-                "Second sell from time", value=dt_time(20, 0),
-                key="battery_soc_scenario_second_start_time",
-            )
-        with scenario_second_cols[2]:
-            scenario_second_end_date = st.date_input(
-                "Second sell until date", value=scenario_current_date,
-                key="battery_soc_scenario_second_end_date",
-            )
-        with scenario_second_cols[3]:
-            scenario_second_end_time = st.time_input(
-                "Second sell until time", value=dt_time(21, 0),
-                key="battery_soc_scenario_second_end_time",
-            )
-        scenario_target_placeholders[1] = st.empty()
-    else:
-        scenario_second_start_date = st.session_state.get(
-            "battery_soc_scenario_second_start_date", scenario_current_date,
-        )
-        scenario_second_start_time = st.session_state.get(
-            "battery_soc_scenario_second_start_time", dt_time(20, 0),
-        )
-        scenario_second_end_date = st.session_state.get(
-            "battery_soc_scenario_second_end_date", scenario_current_date,
-        )
-        scenario_second_end_time = st.session_state.get(
-            "battery_soc_scenario_second_end_time", dt_time(21, 0),
-        )
+    scenario_end_date = st.session_state.get(
+        "battery_soc_scenario_end_date_v2", scenario_default_date,
+    )
+    scenario_end_time = st.session_state.get(
+        "battery_soc_scenario_end_time_v2", dt_time(19, 0),
+    )
+    scenario_second_enabled = st.session_state.get(
+        "battery_soc_scenario_second_enabled", False,
+    )
+    scenario_second_start_date = st.session_state.get(
+        "battery_soc_scenario_second_start_date", scenario_default_date,
+    )
+    scenario_second_start_time = st.session_state.get(
+        "battery_soc_scenario_second_start_time", dt_time(20, 0),
+    )
+    scenario_second_end_date = st.session_state.get(
+        "battery_soc_scenario_second_end_date", scenario_default_date,
+    )
+    scenario_second_end_time = st.session_state.get(
+        "battery_soc_scenario_second_end_time", dt_time(21, 0),
+    )
     scenario_start = pd.Timestamp(datetime.combine(
         scenario_start_date, scenario_start_time,
     )).tz_localize(TZ_NAME)
     scenario_end = pd.Timestamp(datetime.combine(
         scenario_end_date, scenario_end_time,
     )).tz_localize(TZ_NAME)
-    scenario_period_slots = [(0, scenario_start, scenario_end)]
+    scenario_periods = [(scenario_start, scenario_end)]
     if scenario_second_enabled:
-        scenario_period_slots.append((
-            1,
+        scenario_periods.append((
             pd.Timestamp(datetime.combine(
                 scenario_second_start_date, scenario_second_start_time,
             )).tz_localize(TZ_NAME),
@@ -1646,592 +1323,923 @@ else:
                 scenario_second_end_date, scenario_second_end_time,
             )).tz_localize(TZ_NAME),
         ))
-    scenario_periods = merge_time_windows([
-        (period_start, period_end)
-        for _, period_start, period_end in scenario_period_slots
-    ])
-    scenario_window_throughputs_kwh = [0.0] * len(scenario_period_slots)
-    if not load_samples.empty and not scenario_generation.empty and scenario_period_slots:
-        for generation_row in scenario_generation.itertuples(index=False):
-            interval_end = pd.Timestamp(generation_row.time_local)
-            interval_start = interval_end - pd.Timedelta(minutes=30)
-            typical_load_kw = float(
-                load_profile.get(interval_end.strftime("%H:%M"), average_load_kw)
+    scenario_periods = merge_time_windows(scenario_periods)
+    st.subheader("Amber electricity price over time")
+    if amber_prices.empty:
+        st.info("No Amber prices are saved yet. Set AMBER_API_KEY and choose **Fetch Amber prices** in the sidebar.")
+    else:
+        amber_prices["local_date"] = amber_prices["start_time_local"].dt.date.astype(str)
+        price_dates = sorted(pd.to_datetime(amber_prices["local_date"]).dt.date.unique())
+        amber_default = amber_date if amber_date in price_dates else price_dates[-1]
+        amber_date_col, amber_channel_col = st.columns(2)
+        with amber_date_col:
+            amber_chosen_date = date_picker_with_arrows(
+                "Price date (Sydney)", value=amber_default,
+                min_value=price_dates[0], max_value=price_dates[-1], key="amber_price_date_picker",
             )
-            solar_kw = min(
-                SIGEN_INVERTER_LIMIT_KW,
-                max(0.0, (float(generation_row.solcast_kw)
-                          + float(generation_row.openmeteo_kw)) / 2),
+        with amber_channel_col:
+            available_channels = list(dict.fromkeys(amber_prices["channel_type"].dropna().astype(str)))
+            default_channels = [channel for channel in ("feedIn", "general") if channel in available_channels]
+            selected_channels = st.multiselect(
+                "Channels", available_channels,
+                default=default_channels or available_channels,
+                key="amber_price_channels",
             )
-            max_total_export_kw = min(
-                max(0.0, SIGEN_INVERTER_LIMIT_KW - typical_load_kw),
-                SIGEN_SITE_EXPORT_LIMIT_KW,
+        amber_intraday = amber_prices[amber_prices["local_date"] == amber_chosen_date.isoformat()].copy()
+        amber_intraday = amber_intraday[
+            amber_intraday["channel_type"].isin(selected_channels)
+            & amber_intraday["per_kwh"].notna()
+            & amber_intraday["price_type"].str.lower().isin(
+                ("actualinterval", "currentinterval", "forecastinterval")
             )
-            solar_export_kw = min(
-                max(0.0, solar_kw - typical_load_kw), max_total_export_kw,
-            )
-            remaining_export_kw = max(0.0, max_total_export_kw - solar_export_kw)
-            for period_index, period_start, period_end in scenario_period_slots:
-                if period_start >= period_end:
-                    continue
-                overlaps = overlapping_time_segments(
-                    interval_start, interval_end, [(period_start, period_end)],
+        ].copy()
+        amber_intraday["_start_utc"] = pd.to_datetime(amber_intraday["start_time_utc"], utc=True)
+        amber_intraday["_end_utc"] = pd.to_datetime(amber_intraday["end_time_utc"], utc=True)
+        actual_like = amber_intraday[
+            amber_intraday["price_type"].str.lower().isin(("actualinterval", "currentinterval"))
+        ].copy()
+        actual_like["_priority"] = actual_like["price_type"].str.lower().map(
+            {"actualinterval": 0, "currentinterval": 1}
+        )
+        actual_like["_source_duration_minutes"] = (
+            (actual_like["_end_utc"] - actual_like["_start_utc"]).dt.total_seconds() / 60
+        ).round().astype(int)
+        actual_like = (actual_like.sort_values(
+            ["_priority", "_source_duration_minutes", "fetched_at_utc"],
+            ascending=[True, True, False],
+        ).drop_duplicates(["channel_type", "start_time_utc"], keep="first"))
+        forecast = amber_intraday[amber_intraday["price_type"].str.lower() == "forecastinterval"].copy()
+        forecast["_source_duration_minutes"] = (
+            (forecast["_end_utc"] - forecast["_start_utc"]).dt.total_seconds() / 60
+        ).round().astype(int)
+        if amber_chosen_date < pd.Timestamp.now(tz=TZ_NAME).date():
+            # Historical days should show finalized prices, never stale forecasts.
+            forecast = forecast.iloc[0:0].copy()
+        forecast = (forecast.sort_values(
+            ["fetched_at_utc", "_source_duration_minutes"], ascending=[False, True],
+        ).drop_duplicates(["channel_type", "start_time_utc", "end_time_utc"], keep="first"))
+        intervals = pd.concat([actual_like, forecast], ignore_index=True, sort=False)
+        # Expand any longer Amber source interval to 5-minute buckets, then retain
+        # one row per bucket: actual, current, then shortest/latest forecast.
+        bucket_rows = []
+        for _, source_row in intervals.iterrows():
+            bucket_start = source_row["_start_utc"].floor("5min")
+            while bucket_start < source_row["_end_utc"]:
+                bucket = source_row.copy()
+                bucket["_bucket_start_utc"] = bucket_start
+                bucket_rows.append(bucket)
+                bucket_start += pd.Timedelta(minutes=5)
+        amber_intraday = pd.DataFrame(bucket_rows) if bucket_rows else intervals.iloc[0:0].copy()
+        if not amber_intraday.empty:
+            # A forecast can come from an earlier snapshot and extend back to midnight.
+            # Once actual/current prices cover those buckets, only show the dotted
+            # forecast after the latest observed bucket for that channel.
+            latest_observed_bucket = (
+                actual_like.assign(
+                    _bucket_start_utc=actual_like["_start_utc"].dt.floor("5min"),
                 )
-                period_hours = sum(
-                    (overlap_end - overlap_start).total_seconds() / 3600
-                    for overlap_start, overlap_end in overlaps
-                )
-                scenario_window_throughputs_kwh[period_index] += (
-                    remaining_export_kw * period_hours
-                )
-    scenario_inverter_throughput_kwh = sum(scenario_window_throughputs_kwh)
-    scenario_inverter_max_sell_kwh_by_window = [
-        min(SIGEN_BATTERY_CAPACITY_KWH, throughput)
-        for throughput in scenario_window_throughputs_kwh
-    ]
-    scenario_inverter_max_sell_pcts = [
-        min(100, int(np.floor(
-            max_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100 + 1e-9
-        )))
-        for max_kwh in scenario_inverter_max_sell_kwh_by_window
-    ]
-    scenario_soc_start_by_window = [None] * len(scenario_period_slots)
-    if (not scenario_generation.empty and not battery_soc.empty
-            and pd.Timedelta(0) <= pd.Timestamp.now(tz=TZ_NAME) - latest_soc_time
-            <= pd.Timedelta(hours=12)):
-        preview_target_kwh = []
-        for period_index, _, _ in scenario_period_slots:
-            preview_key = f"battery_soc_scenario_sell_pct_{period_index + 1}"
-            try:
-                preview_pct = float(st.session_state.get(
-                    preview_key,
-                    min(20, scenario_inverter_max_sell_pcts[period_index]),
-                ))
-            except (TypeError, ValueError):
-                preview_pct = 0.0
-            preview_pct = float(np.clip(
-                preview_pct, 0, scenario_inverter_max_sell_pcts[period_index],
-            ))
-            preview_target_kwh.append(
-                SIGEN_BATTERY_CAPACITY_KWH * preview_pct / 100
+                .groupby("channel_type")["_bucket_start_utc"]
+                .max()
+                .to_dict()
             )
+            if latest_observed_bucket:
+                observed_cutoff = amber_intraday["channel_type"].map(latest_observed_bucket)
+                stale_forecast = (
+                    amber_intraday["price_type"].str.lower().eq("forecastinterval")
+                    & observed_cutoff.notna()
+                    & (amber_intraday["_bucket_start_utc"] <= observed_cutoff)
+                )
+                amber_intraday = amber_intraday[~stale_forecast].copy()
+            amber_intraday["_priority"] = amber_intraday["price_type"].str.lower().map(
+                {"actualinterval": 0, "currentinterval": 1, "forecastinterval": 2}
+            )
+            amber_intraday = (amber_intraday.sort_values(
+                ["_priority", "_source_duration_minutes", "fetched_at_utc"],
+                ascending=[True, True, False],
+            ).drop_duplicates(["channel_type", "_bucket_start_utc"], keep="first"))
+            amber_intraday["start_time_local"] = amber_intraday["_bucket_start_utc"].dt.tz_convert(TZ_NAME)
+            amber_intraday = amber_intraday.sort_values("start_time_local")
+        chart_prices = amber_intraday["per_kwh"].astype(float).where(
+            amber_intraday["channel_type"] != "feedIn", -amber_intraday["per_kwh"].astype(float)
+        ).dropna()
+        use_log_axis = not chart_prices.empty and chart_prices.abs().max() > 100
+        # Use the symmetric-log transform for large prices so a zero tick can
+        # always be shown, including when every selected price is positive.
+        use_symmetric_log = use_log_axis
 
-        def scenario_soc_at_window_start(window_start):
-            """Run the scenario through a window's start and return its SOC there."""
-            soc = float(latest_soc["Battery state of charge (%)"])
-            sold_by_window = [0.0] * len(scenario_period_slots)
-            for generation_row in scenario_generation.itertuples(index=False):
-                forecast_time = pd.Timestamp(generation_row.time_local)
-                if forecast_time <= latest_soc_time:
-                    continue
-                interval_start = max(
-                    forecast_time - pd.Timedelta(minutes=30), latest_soc_time,
+        def symmetric_log(value):
+            return np.sign(value) * np.log10(1 + np.abs(value))
+
+        price_fig = go.Figure()
+        channel_colors = {"general": "#2ca02c", "feedIn": "#f1c40f", "controlledLoad": "#9467bd"}
+        for channel_type, channel_prices in amber_intraday.groupby("channel_type", sort=False):
+            channel_prices = channel_prices.sort_values("start_time_local")
+            actual_prices = channel_prices[channel_prices["price_type"].str.lower() != "forecastinterval"]
+            forecast_prices = channel_prices[channel_prices["price_type"].str.lower() == "forecastinterval"]
+            line_color = channel_colors.get(channel_type)
+
+            def add_amber_price_trace(price_series, dash, showlegend, name):
+                if price_series.empty:
+                    return
+                plotted_price = -price_series["per_kwh"] if channel_type == "feedIn" else price_series["per_kwh"]
+                source_resolution = price_series["_source_duration_minutes"].astype(str) + " min source interval"
+                plotted_y = symmetric_log(plotted_price) if use_symmetric_log else plotted_price
+                price_fig.add_trace(go.Scatter(
+                    x=price_series["start_time_local"], y=plotted_y,
+                    mode="lines", connectgaps=False,
+                    name=name, showlegend=showlegend,
+                    line=dict(color=line_color, dash=dash),
+                    customdata=list(zip(
+                        plotted_price.to_numpy(), source_resolution.to_numpy(),
+                        price_series["price_type"].to_numpy(),
+                    )),
+                    hovertemplate="%{x|%H:%M}<br>Price: %{customdata[0]:.3f} ¢/kWh"
+                                  "<br>Amber type: %{customdata[2]}<br>%{customdata[1]}<extra></extra>",
+                ))
+
+            legend_name = f"Amber · {channel_type} (¢/kWh)"
+            if actual_prices.empty:
+                # Keep a solid channel key in the legend even on forecast-only dates.
+                price_fig.add_trace(go.Scatter(
+                    x=[None], y=[None], mode="lines", name=legend_name,
+                    line=dict(color=line_color),
+                ))
+            else:
+                add_amber_price_trace(actual_prices, "solid", True, legend_name)
+            add_amber_price_trace(forecast_prices, "dot", False, legend_name)
+        if use_symmetric_log:
+            price_limit = float(chart_prices.abs().max())
+            max_exponent = max(0, math.ceil(math.log10(price_limit)))
+            tick_prices = {0.0}
+            for exponent in range(max_exponent + 1):
+                decade = 10 ** exponent
+                tick_prices.update(value * decade for value in (1, 2, 5) if value * decade <= price_limit)
+            symmetric_ticks = sorted({
+                tick for value in tick_prices for tick in (-value, value)
+                if chart_prices.min() <= tick <= chart_prices.max()
+            } | {0.0})
+            axis_config = dict(
+                type="linear", title="Price (¢/kWh, symmetric log)", tickmode="array",
+                tickvals=[float(symmetric_log(value)) for value in symmetric_ticks],
+                ticktext=[f"{value:g}" for value in symmetric_ticks],
+                range=[
+                    float(symmetric_log(min(0.0, chart_prices.min()))),
+                    float(symmetric_log(max(0.0, chart_prices.max()))),
+                ],
+            )
+        else:
+            axis_config = dict(title="Price (¢/kWh)", rangemode="tozero")
+        price_fig.update_layout(xaxis_title="Time (Sydney)", yaxis=axis_config,
+                                margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
+        chart_day_start = pd.Timestamp(amber_chosen_date).tz_localize(TZ_NAME)
+        chart_day_end = chart_day_start + pd.DateOffset(days=1)
+        price_fig.update_xaxes(range=[chart_day_start, chart_day_end])
+        for scenario_window_start, scenario_window_end in scenario_periods:
+            scenario_window_start = max(scenario_window_start, chart_day_start)
+            scenario_window_end = min(scenario_window_end, chart_day_end)
+            if scenario_window_start < scenario_window_end:
+                price_fig.add_shape(
+                    type="rect", xref="x", yref="paper",
+                    x0=scenario_window_start, x1=scenario_window_end,
+                    y0=0, y1=1, layer="below",
+                    fillcolor="rgba(128,128,128,0.2)", line=dict(width=0),
                 )
-                interval_end = min(forecast_time, window_start)
-                if interval_start >= interval_end:
-                    if interval_start >= window_start:
-                        break
-                    continue
-                slot = forecast_time.strftime("%H:%M")
-                load_kw = float(load_profile.get(slot, average_load_kw))
+        place_legend_below_chart(price_fig)
+        st.plotly_chart(price_fig, width="stretch")
+
+    st.subheader("Sigen battery state of charge")
+    battery_soc = (
+        energy_actuals.dropna(subset=["Battery state of charge (%)"])
+        if not energy_actuals.empty else pd.DataFrame()
+    )
+    if battery_soc.empty:
+        st.info("No battery state-of-charge values were found in sigen_energy_actuals.battery_soc.")
+    else:
+        battery_soc_dates = sorted(battery_soc["local_date"].unique())
+        battery_soc_default = battery_soc_dates[-1]
+        forecast_date_candidates = []
+        if not history.empty and "local_date" in history:
+            forecast_date_candidates.extend(history["local_date"].dropna().astype(str).tolist())
+        if not openmeteo_forecast_hourly.empty and "local_date" in openmeteo_forecast_hourly:
+            forecast_date_candidates.extend(
+                openmeteo_forecast_hourly["local_date"].dropna().astype(str).tolist()
+            )
+        latest_selectable_date = max([*battery_soc_dates, *forecast_date_candidates])
+        battery_soc_date = half_width_date_picker_with_arrows(
+            "Battery SOC date", pd.Timestamp(battery_soc_default).date(),
+            min_value=pd.Timestamp(battery_soc_dates[0]).date(),
+            max_value=pd.Timestamp(latest_selectable_date).date(),
+            key="sigen_battery_soc_date",
+        ).isoformat()
+        latest_soc = battery_soc.sort_values("period_end_local").iloc[-1]
+        latest_soc_time = pd.Timestamp(latest_soc["period_end_local"])
+        load_samples = energy_actuals[
+            energy_actuals["load_power_kw"].notna()
+            & (energy_actuals["period_end_local"] <= latest_soc_time)
+            & (energy_actuals["period_end_local"] > latest_soc_time - pd.Timedelta(days=7))
+        ].copy()
+        if not load_samples.empty:
+            load_samples["slot_end"] = load_samples["period_end_local"].dt.ceil("30min")
+            load_samples["slot"] = load_samples["slot_end"].dt.strftime("%H:%M")
+            load_profile = load_samples.groupby("slot")["load_power_kw"].mean()
+            average_load_kw = float(load_samples["load_power_kw"].mean())
+        else:
+            load_profile = pd.Series(dtype=float)
+            average_load_kw = 0.0
+        scenario_generation = pd.DataFrame(columns=["time_local", "solcast_kw", "openmeteo_kw"])
+        if not history.empty and not openmeteo_forecast_hourly.empty:
+            solcast_projection = history.dropna(subset=["pv_estimate"]).copy()
+            solcast_projection = (
+                solcast_projection.sort_values("downloaded_at_utc", ascending=False)
+                .drop_duplicates("period_end_utc", keep="first")
+            )
+            solcast_projection = solcast_projection[
+                solcast_projection["period_end_utc"] > latest_soc_time.tz_convert("UTC")
+            ][["period_end_local", "pv_estimate"]].rename(
+                columns={"period_end_local": "time_local", "pv_estimate": "solcast_kw"}
+            )
+            openmeteo_projection = openmeteo_forecast_hourly[
+                ["time_local", "openmeteo_power_kw"]
+            ].dropna().copy()
+            openmeteo_projection["time_local"] = pd.to_datetime(openmeteo_projection["time_local"])
+            openmeteo_projection["time_local"] = (
+                openmeteo_projection["time_local"].dt.floor("30min")
+                + pd.Timedelta(minutes=30)
+            )
+            openmeteo_projection = openmeteo_projection.groupby("time_local", as_index=False).agg(
+                openmeteo_kw=("openmeteo_power_kw", "mean"),
+            )
+            scenario_generation = solcast_projection.merge(
+                openmeteo_projection, on="time_local", how="inner",
+            ).sort_values("time_local")
+        scenario_current_date = pd.Timestamp.now(tz=TZ_NAME).date()
+        scenario_cols = st.columns([1, 1, 1, 1])
+        with scenario_cols[0]:
+            scenario_start_date = st.date_input(
+                "Sell from date", value=scenario_current_date,
+                key="battery_soc_scenario_start_date_v2",
+            )
+        with scenario_cols[1]:
+            scenario_start_time = st.time_input(
+                "Sell from time", value=dt_time(18, 0),
+                key="battery_soc_scenario_start_time_v2",
+            )
+        with scenario_cols[2]:
+            scenario_end_date = st.date_input(
+                "Sell until date", value=scenario_current_date,
+                key="battery_soc_scenario_end_date_v2",
+            )
+        with scenario_cols[3]:
+            scenario_end_time = st.time_input(
+                "Sell until time", value=dt_time(19, 0),
+                key="battery_soc_scenario_end_time_v2",
+            )
+        scenario_target_placeholders = {0: st.empty()}
+        scenario_second_enabled = st.checkbox(
+            "Add a second sell period", key="battery_soc_scenario_second_enabled",
+        )
+        if scenario_second_enabled:
+            scenario_second_cols = st.columns([1, 1, 1, 1])
+            with scenario_second_cols[0]:
+                scenario_second_start_date = st.date_input(
+                    "Second sell from date", value=scenario_current_date,
+                    key="battery_soc_scenario_second_start_date",
+                )
+            with scenario_second_cols[1]:
+                scenario_second_start_time = st.time_input(
+                    "Second sell from time", value=dt_time(20, 0),
+                    key="battery_soc_scenario_second_start_time",
+                )
+            with scenario_second_cols[2]:
+                scenario_second_end_date = st.date_input(
+                    "Second sell until date", value=scenario_current_date,
+                    key="battery_soc_scenario_second_end_date",
+                )
+            with scenario_second_cols[3]:
+                scenario_second_end_time = st.time_input(
+                    "Second sell until time", value=dt_time(21, 0),
+                    key="battery_soc_scenario_second_end_time",
+                )
+            scenario_target_placeholders[1] = st.empty()
+        else:
+            scenario_second_start_date = st.session_state.get(
+                "battery_soc_scenario_second_start_date", scenario_current_date,
+            )
+            scenario_second_start_time = st.session_state.get(
+                "battery_soc_scenario_second_start_time", dt_time(20, 0),
+            )
+            scenario_second_end_date = st.session_state.get(
+                "battery_soc_scenario_second_end_date", scenario_current_date,
+            )
+            scenario_second_end_time = st.session_state.get(
+                "battery_soc_scenario_second_end_time", dt_time(21, 0),
+            )
+        scenario_start = pd.Timestamp(datetime.combine(
+            scenario_start_date, scenario_start_time,
+        )).tz_localize(TZ_NAME)
+        scenario_end = pd.Timestamp(datetime.combine(
+            scenario_end_date, scenario_end_time,
+        )).tz_localize(TZ_NAME)
+        scenario_period_slots = [(0, scenario_start, scenario_end)]
+        if scenario_second_enabled:
+            scenario_period_slots.append((
+                1,
+                pd.Timestamp(datetime.combine(
+                    scenario_second_start_date, scenario_second_start_time,
+                )).tz_localize(TZ_NAME),
+                pd.Timestamp(datetime.combine(
+                    scenario_second_end_date, scenario_second_end_time,
+                )).tz_localize(TZ_NAME),
+            ))
+        scenario_periods = merge_time_windows([
+            (period_start, period_end)
+            for _, period_start, period_end in scenario_period_slots
+        ])
+        scenario_window_throughputs_kwh = [0.0] * len(scenario_period_slots)
+        if not load_samples.empty and not scenario_generation.empty and scenario_period_slots:
+            for generation_row in scenario_generation.itertuples(index=False):
+                interval_end = pd.Timestamp(generation_row.time_local)
+                interval_start = interval_end - pd.Timedelta(minutes=30)
+                typical_load_kw = float(
+                    load_profile.get(interval_end.strftime("%H:%M"), average_load_kw)
+                )
                 solar_kw = min(
                     SIGEN_INVERTER_LIMIT_KW,
                     max(0.0, (float(generation_row.solcast_kw)
                               + float(generation_row.openmeteo_kw)) / 2),
                 )
-                sale_segments = []
+                max_total_export_kw = min(
+                    max(0.0, SIGEN_INVERTER_LIMIT_KW - typical_load_kw),
+                    SIGEN_SITE_EXPORT_LIMIT_KW,
+                )
+                solar_export_kw = min(
+                    max(0.0, solar_kw - typical_load_kw), max_total_export_kw,
+                )
+                remaining_export_kw = max(0.0, max_total_export_kw - solar_export_kw)
                 for period_index, period_start, period_end in scenario_period_slots:
                     if period_start >= period_end:
                         continue
-                    sale_start = max(interval_start, period_start)
-                    sale_end = min(interval_end, period_end)
-                    if sale_start < sale_end:
-                        sale_segments.append((period_index, sale_start, sale_end))
-                sale_hours = sum(
-                    (sale_end - sale_start).total_seconds() / 3600
-                    for _, sale_start, sale_end in sale_segments
-                )
-                if sale_hours > 0:
-                    max_total_export_kw = min(
-                        max(0.0, SIGEN_INVERTER_LIMIT_KW - load_kw),
-                        SIGEN_SITE_EXPORT_LIMIT_KW,
+                    overlaps = overlapping_time_segments(
+                        interval_start, interval_end, [(period_start, period_end)],
                     )
-                    solar_export_kw = min(
-                        max(0.0, solar_kw - load_kw), max_total_export_kw,
+                    period_hours = sum(
+                        (overlap_end - overlap_start).total_seconds() / 3600
+                        for overlap_start, overlap_end in overlaps
                     )
-                    battery_export_headroom_kw = max(
-                        0.0, max_total_export_kw - solar_export_kw,
+                    scenario_window_throughputs_kwh[period_index] += (
+                        remaining_export_kw * period_hours
                     )
-                    net_battery_kwh = (
-                        (solar_kw - load_kw) * ((interval_end - interval_start).total_seconds() / 3600 - sale_hours)
-                        + (solar_kw - load_kw - solar_export_kw) * sale_hours
-                    )
-                else:
-                    battery_export_headroom_kw = 0.0
-                    net_battery_kwh = (
-                        solar_kw - load_kw
-                    ) * (interval_end - interval_start).total_seconds() / 3600
-                soc += (
-                    net_battery_kwh * 0.95
-                    if net_battery_kwh >= 0 else net_battery_kwh / 0.95
-                ) / SIGEN_BATTERY_CAPACITY_KWH * 100
-                soc = float(np.clip(soc, 0, 100))
-                for period_index, sale_start, sale_end in sale_segments:
-                    segment_hours = (sale_end - sale_start).total_seconds() / 3600
-                    sale_kwh = max(0.0, min(
-                        battery_export_headroom_kw * segment_hours,
-                        preview_target_kwh[period_index] - sold_by_window[period_index],
-                        soc / 100 * SIGEN_BATTERY_CAPACITY_KWH * 0.95,
+        scenario_inverter_throughput_kwh = sum(scenario_window_throughputs_kwh)
+        scenario_inverter_max_sell_kwh_by_window = [
+            min(SIGEN_BATTERY_CAPACITY_KWH, throughput)
+            for throughput in scenario_window_throughputs_kwh
+        ]
+        scenario_inverter_max_sell_pcts = [
+            min(100, int(np.floor(
+                max_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100 + 1e-9
+            )))
+            for max_kwh in scenario_inverter_max_sell_kwh_by_window
+        ]
+        scenario_soc_start_by_window = [None] * len(scenario_period_slots)
+        if (not scenario_generation.empty and not battery_soc.empty
+                and pd.Timedelta(0) <= pd.Timestamp.now(tz=TZ_NAME) - latest_soc_time
+                <= pd.Timedelta(hours=12)):
+            preview_target_kwh = []
+            for period_index, _, _ in scenario_period_slots:
+                preview_key = f"battery_soc_scenario_sell_pct_{period_index + 1}"
+                try:
+                    preview_pct = float(st.session_state.get(
+                        preview_key,
+                        min(20, scenario_inverter_max_sell_pcts[period_index]),
                     ))
-                    sold_by_window[period_index] += sale_kwh
-                    soc = max(
-                        0.0,
-                        soc - sale_kwh / (
-                            SIGEN_BATTERY_CAPACITY_KWH * 0.95
-                        ) * 100,
+                except (TypeError, ValueError):
+                    preview_pct = 0.0
+                preview_pct = float(np.clip(
+                    preview_pct, 0, scenario_inverter_max_sell_pcts[period_index],
+                ))
+                preview_target_kwh.append(
+                    SIGEN_BATTERY_CAPACITY_KWH * preview_pct / 100
+                )
+
+            def scenario_soc_at_window_start(window_start):
+                """Run the scenario through a window's start and return its SOC there."""
+                soc = float(latest_soc["Battery state of charge (%)"])
+                sold_by_window = [0.0] * len(scenario_period_slots)
+                for generation_row in scenario_generation.itertuples(index=False):
+                    forecast_time = pd.Timestamp(generation_row.time_local)
+                    if forecast_time <= latest_soc_time:
+                        continue
+                    interval_start = max(
+                        forecast_time - pd.Timedelta(minutes=30), latest_soc_time,
                     )
-                if interval_end >= window_start:
-                    break
-            return soc
-
-        for period_index, period_start, period_end in scenario_period_slots:
-            if period_start < period_end and period_start >= latest_soc_time:
-                scenario_soc_start_by_window[period_index] = (
-                    scenario_soc_at_window_start(period_start)
-                )
-
-    # Bound each target by the scenario SOC remaining at that window's start.
-    scenario_max_sell_kwh_by_window = []
-    for period_index, period_start, period_end in scenario_period_slots:
-        start_soc = scenario_soc_start_by_window[period_index]
-        if start_soc is None:
-            scenario_max_sell_kwh_by_window.append(
-                scenario_inverter_max_sell_kwh_by_window[period_index]
-            )
-            continue
-        available_battery_kwh = max(
-            0.0, start_soc / 100 * SIGEN_BATTERY_CAPACITY_KWH * 0.95,
-        )
-        scenario_max_sell_kwh_by_window.append(min(
-            scenario_inverter_max_sell_kwh_by_window[period_index],
-            available_battery_kwh,
-        ))
-    scenario_max_sell_pcts = [
-        min(100, int(np.floor(
-            max_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100 + 1e-9
-        )))
-        for max_kwh in scenario_max_sell_kwh_by_window
-    ]
-    scenario_sell_pcts = [0.0] * len(scenario_period_slots)
-    for window_index, (period_index, _, _) in enumerate(scenario_period_slots):
-        max_pct = scenario_max_sell_pcts[period_index]
-        with scenario_target_placeholders[period_index].container():
-            input_cols = st.columns([2, 1])
-            with input_cols[0]:
-                raw_pct = st.text_input(
-                    f"Sell target for period {window_index + 1} (%)",
-                    value=st.session_state.get(
-                        f"battery_soc_scenario_sell_pct_{window_index + 1}",
-                        str(min(20, max_pct)),
-                    ),
-                    key=f"battery_soc_scenario_sell_pct_{window_index + 1}",
-                    help="Percentage of the 24 kWh battery to target during this sell period.",
-                )
-            with input_cols[1]:
-                _, period_start, period_end = scenario_period_slots[window_index]
-                if period_start < period_end:
-                    period_window_text = (
-                        f"{period_start.strftime('%d %b %H:%M')}–"
-                        f"{period_end.strftime('%d %b %H:%M')}"
-                    )
-                else:
-                    period_window_text = "Invalid time window"
-                start_soc_text = (
-                    f"SOC at start {scenario_soc_start_by_window[period_index]:.1f}%"
-                    if scenario_soc_start_by_window[period_index] is not None
-                    else "SOC forecast unavailable"
-                )
-                st.markdown(
-                    f"**Maximum: {max_pct}%**  \n"
-                    f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
-                    f"{period_window_text}  ·  {start_soc_text}"
-                )
-        try:
-            sell_pct = float(raw_pct.strip())
-            if not np.isfinite(sell_pct):
-                raise ValueError
-        except (AttributeError, TypeError, ValueError):
-            sell_pct = 0.0
-            st.warning(f"Sell target for period {window_index + 1} must be a number; using 0%.")
-        if sell_pct < 0:
-            sell_pct = 0.0
-            st.warning(f"Sell target for period {window_index + 1} cannot be negative; using 0%.")
-        if sell_pct > max_pct:
-            sell_pct = float(max_pct)
-            st.warning(
-                f"Sell target for period {window_index + 1} exceeds its maximum; "
-                f"using {max_pct}%."
-            )
-        scenario_sell_pcts[period_index] = sell_pct
-    st.caption(
-        f"Estimated additional battery export capacity across the selected windows: "
-        f"{scenario_inverter_throughput_kwh:.1f} kWh. Per-window capacity: "
-        f"{', '.join(f'{value:.1f} kWh' for value in scenario_window_throughputs_kwh) or '—'}. "
-        f"Maximum target per window: "
-        f"{', '.join(f'{value:.1f} kWh ({pct}%)' for value, pct in zip(scenario_max_sell_kwh_by_window, scenario_max_sell_pcts)) or '—'}. "
-        f"Export limit assumed: "
-        f"{SIGEN_SITE_EXPORT_LIMIT_KW:.1f} kW. Set SIGEN_EXPORT_LIMIT_KW to your configured site limit."
-    )
-    battery_soc_intraday = battery_soc[
-        battery_soc["local_date"] == battery_soc_date
-    ].sort_values("period_end_local")
-    soc_fig = go.Figure()
-    soc_fig.add_trace(go.Scatter(
-        x=battery_soc_intraday["period_end_local"],
-        y=battery_soc_intraday["Battery state of charge (%)"],
-        mode="lines", name="Battery state of charge",
-        line=dict(width=2, color="#4c78a8"), connectgaps=False,
-        hovertemplate="%{x|%H:%M}<br>Battery SOC: %{y:.1f}%<extra></extra>",
-    ))
-    soc_day_start = pd.Timestamp(battery_soc_date).tz_localize(TZ_NAME)
-    projection_available = False
-    projection_caption = ""
-    now_local = pd.Timestamp.now(tz=TZ_NAME)
-    can_project_from_latest_soc = (
-        pd.Timedelta(0) <= now_local - latest_soc_time <= pd.Timedelta(hours=12)
-    )
-    projection_path = pd.DataFrame()
-    scenario_sale_revenue = 0.0
-    scenario_sold_kwh = 0.0
-    scenario_priced_kwh = 0.0
-    scenario_amber_price_lookup = pd.DataFrame()
-    if not amber_prices.empty:
-        scenario_amber_prices = amber_prices[
-            (amber_prices["channel_type"] == "feedIn")
-            & amber_prices["per_kwh"].notna()
-            & amber_prices["price_type"].str.lower().isin(
-                ("actualinterval", "currentinterval", "forecastinterval")
-            )
-        ].copy()
-        if not scenario_amber_prices.empty:
-            scenario_amber_prices["_start_local"] = pd.to_datetime(
-                scenario_amber_prices["start_time_local"]
-            )
-            scenario_amber_prices["_end_local"] = pd.to_datetime(
-                scenario_amber_prices["end_time_local"]
-            )
-            scenario_amber_prices["_priority"] = scenario_amber_prices[
-                "price_type"
-            ].str.lower().map({"actualinterval": 0, "currentinterval": 1, "forecastinterval": 2})
-            scenario_amber_prices["_duration_minutes"] = (
-                (scenario_amber_prices["_end_local"]
-                 - scenario_amber_prices["_start_local"]).dt.total_seconds() / 60
-            )
-            bucket_rows = []
-            for _, price_row in scenario_amber_prices.iterrows():
-                bucket_start = price_row["_start_local"].floor("5min")
-                while bucket_start < price_row["_end_local"]:
-                    bucket_rows.append({
-                        "bucket_start": bucket_start,
-                        "per_kwh": float(price_row["per_kwh"]),
-                        "priority": int(price_row["_priority"]),
-                        "duration_minutes": float(price_row["_duration_minutes"]),
-                        "fetched_at_utc": price_row["fetched_at_utc"],
-                    })
-                    bucket_start += pd.Timedelta(minutes=5)
-            if bucket_rows:
-                scenario_amber_price_lookup = (
-                    pd.DataFrame(bucket_rows)
-                    .sort_values(
-                        ["priority", "duration_minutes", "fetched_at_utc"],
-                        ascending=[True, True, False],
-                    )
-                    .drop_duplicates("bucket_start", keep="first")
-                    .set_index("bucket_start")
-                )
-    if (can_project_from_latest_soc and not load_samples.empty
-            and not openmeteo_forecast_hourly.empty and not history.empty):
-        paired_generation = scenario_generation.copy()
-        if not paired_generation.empty:
-            current_soc = float(latest_soc["Battery state of charge (%)"])
-            low_soc = current_soc
-            high_soc = current_soc
-            midpoint_soc = current_soc
-            low_values, high_values, midpoint_values = [], [], []
-            for forecast_row in paired_generation.itertuples(index=False):
-                slot = forecast_row.time_local.strftime("%H:%M")
-                load_kw = float(load_profile.get(slot, average_load_kw))
-                load_kwh = load_kw * 0.5
-                solar_values = [max(0.0, float(forecast_row.solcast_kw)),
-                                max(0.0, float(forecast_row.openmeteo_kw))]
-
-                def advance_soc(soc, solar_kw):
-                    net_battery_kwh = solar_kw * 0.5 - load_kwh
-                    stored_kwh = net_battery_kwh * 0.95 if net_battery_kwh >= 0 else net_battery_kwh / 0.95
-                    return float(np.clip(
-                        soc + stored_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100, 0, 100,
-                    ))
-
-                low_soc = advance_soc(low_soc, min(solar_values))
-                high_soc = advance_soc(high_soc, max(solar_values))
-                midpoint_soc = advance_soc(midpoint_soc, sum(solar_values) / 2)
-                low_values.append(low_soc)
-                high_values.append(high_soc)
-                midpoint_values.append(midpoint_soc)
-
-            projection_times = paired_generation["time_local"]
-            projection_times = pd.DatetimeIndex([latest_soc_time]).append(
-                pd.DatetimeIndex(projection_times)
-            )
-            low_values = [current_soc, *low_values]
-            high_values = [current_soc, *high_values]
-            midpoint_values = [current_soc, *midpoint_values]
-            projection_path = pd.DataFrame({
-                "time_local": projection_times,
-                "soc_low": low_values,
-                "soc_high": high_values,
-                "soc_midpoint": midpoint_values,
-            })
-            if any(sell_pct > 0 for sell_pct in scenario_sell_pcts) and scenario_periods:
-                target_sale_kwh_by_window = [
-                    SIGEN_BATTERY_CAPACITY_KWH * sell_pct / 100
-                    for sell_pct in scenario_sell_pcts
-                ]
-                window_sold_kwh = [0.0] * len(scenario_period_slots)
-                scenario_soc = current_soc
-                scenario_values = [scenario_soc]
-                for forecast_row in paired_generation.itertuples(index=False):
-                    forecast_time = pd.Timestamp(forecast_row.time_local)
+                    interval_end = min(forecast_time, window_start)
+                    if interval_start >= interval_end:
+                        if interval_start >= window_start:
+                            break
+                        continue
                     slot = forecast_time.strftime("%H:%M")
-                    typical_load_kw = float(load_profile.get(slot, average_load_kw))
+                    load_kw = float(load_profile.get(slot, average_load_kw))
                     solar_kw = min(
                         SIGEN_INVERTER_LIMIT_KW,
-                        max(0.0, (float(forecast_row.solcast_kw)
-                                  + float(forecast_row.openmeteo_kw)) / 2),
+                        max(0.0, (float(generation_row.solcast_kw)
+                                  + float(generation_row.openmeteo_kw)) / 2),
                     )
-                    interval_start = forecast_time - pd.Timedelta(minutes=30)
                     sale_segments = []
-                    if forecast_time > latest_soc_time:
-                        for period_index, period_start, period_end in scenario_period_slots:
-                            if period_start >= period_end:
-                                continue
-                            sale_start = max(interval_start, period_start)
-                            sale_end = min(forecast_time, period_end)
-                            if sale_start < sale_end:
-                                sale_segments.append((period_index, sale_start, sale_end))
+                    for period_index, period_start, period_end in scenario_period_slots:
+                        if period_start >= period_end:
+                            continue
+                        sale_start = max(interval_start, period_start)
+                        sale_end = min(interval_end, period_end)
+                        if sale_start < sale_end:
+                            sale_segments.append((period_index, sale_start, sale_end))
                     sale_hours = sum(
                         (sale_end - sale_start).total_seconds() / 3600
                         for _, sale_start, sale_end in sale_segments
                     )
-                    sale_period_active = sale_hours > 0
-                    battery_export_headroom_kw = 0.0
-                    if sale_period_active:
+                    if sale_hours > 0:
                         max_total_export_kw = min(
-                            max(0.0, SIGEN_INVERTER_LIMIT_KW - typical_load_kw),
+                            max(0.0, SIGEN_INVERTER_LIMIT_KW - load_kw),
                             SIGEN_SITE_EXPORT_LIMIT_KW,
                         )
                         solar_export_kw = min(
-                            max(0.0, solar_kw - typical_load_kw),
-                            max_total_export_kw,
+                            max(0.0, solar_kw - load_kw), max_total_export_kw,
                         )
                         battery_export_headroom_kw = max(
                             0.0, max_total_export_kw - solar_export_kw,
                         )
                         net_battery_kwh = (
-                            (solar_kw - typical_load_kw)
-                            * (0.5 - sale_hours)
-                            + (solar_kw - typical_load_kw - solar_export_kw)
-                            * sale_hours
+                            (solar_kw - load_kw) * ((interval_end - interval_start).total_seconds() / 3600 - sale_hours)
+                            + (solar_kw - load_kw - solar_export_kw) * sale_hours
                         )
                     else:
-                        net_battery_kwh = (solar_kw - typical_load_kw) * 0.5
-                    if net_battery_kwh >= 0:
-                        scenario_soc += (
-                            net_battery_kwh * 0.95
-                            / SIGEN_BATTERY_CAPACITY_KWH * 100
+                        battery_export_headroom_kw = 0.0
+                        net_battery_kwh = (
+                            solar_kw - load_kw
+                        ) * (interval_end - interval_start).total_seconds() / 3600
+                    soc += (
+                        net_battery_kwh * 0.95
+                        if net_battery_kwh >= 0 else net_battery_kwh / 0.95
+                    ) / SIGEN_BATTERY_CAPACITY_KWH * 100
+                    soc = float(np.clip(soc, 0, 100))
+                    for period_index, sale_start, sale_end in sale_segments:
+                        segment_hours = (sale_end - sale_start).total_seconds() / 3600
+                        sale_kwh = max(0.0, min(
+                            battery_export_headroom_kw * segment_hours,
+                            preview_target_kwh[period_index] - sold_by_window[period_index],
+                            soc / 100 * SIGEN_BATTERY_CAPACITY_KWH * 0.95,
+                        ))
+                        sold_by_window[period_index] += sale_kwh
+                        soc = max(
+                            0.0,
+                            soc - sale_kwh / (
+                                SIGEN_BATTERY_CAPACITY_KWH * 0.95
+                            ) * 100,
                         )
-                    else:
-                        scenario_soc += (
-                            net_battery_kwh / 0.95
-                            / SIGEN_BATTERY_CAPACITY_KWH * 100
-                        )
-                    scenario_soc = float(np.clip(scenario_soc, 0, 100))
-                    forecast_time = pd.Timestamp(forecast_time)
-                    if sale_period_active:
-                        for period_index, sale_start, sale_end in sale_segments:
-                            segment_hours = (sale_end - sale_start).total_seconds() / 3600
-                            available_ac_energy_kwh = (
-                                scenario_soc / 100
-                                * SIGEN_BATTERY_CAPACITY_KWH * 0.95
-                            )
-                            segment_sale_kwh = max(0.0, min(
-                                battery_export_headroom_kw * segment_hours,
-                                target_sale_kwh_by_window[period_index]
-                                - window_sold_kwh[period_index],
-                                available_ac_energy_kwh,
-                            ))
-                            window_sold_kwh[period_index] += segment_sale_kwh
-                            scenario_sold_kwh += segment_sale_kwh
-                            scenario_soc = max(
-                                0.0,
-                                scenario_soc - segment_sale_kwh / (
-                                    SIGEN_BATTERY_CAPACITY_KWH * 0.95
-                                ) * 100,
-                            )
-                            if segment_sale_kwh > 0 and not scenario_amber_price_lookup.empty:
-                                price_values = []
-                                price_weights = []
-                                price_start = sale_start.floor("5min")
-                                while price_start < sale_end:
-                                    bucket_end = price_start + pd.Timedelta(minutes=5)
-                                    overlap_start = max(price_start, sale_start)
-                                    overlap_end = min(bucket_end, sale_end)
-                                    overlap_minutes = max(
-                                        0.0,
-                                        (overlap_end - overlap_start).total_seconds() / 60,
-                                    )
-                                    try:
-                                        bucket_price = scenario_amber_price_lookup.loc[
-                                            price_start, "per_kwh"
-                                        ]
-                                        if isinstance(bucket_price, pd.Series):
-                                            bucket_price = bucket_price.iloc[0]
-                                    except KeyError:
-                                        bucket_price = None
-                                    if bucket_price is not None and overlap_minutes > 0:
-                                        price_values.append(float(bucket_price))
-                                        price_weights.append(overlap_minutes)
-                                    price_start = bucket_end
-                                if price_weights:
-                                    average_price_cents = float(np.average(
-                                        price_values, weights=price_weights,
-                                    ))
-                                    priced_fraction = min(
-                                        1.0,
-                                        sum(price_weights) / max(segment_hours * 60, 1e-9),
-                                    )
-                                    priced_sale_kwh = segment_sale_kwh * priced_fraction
-                                    scenario_sale_revenue += (
-                                        priced_sale_kwh * average_price_cents / 100
-                                    )
-                                    scenario_priced_kwh += priced_sale_kwh
-                    scenario_values.append(scenario_soc)
-                projection_path["soc_scenario"] = scenario_values
-            projection_available = True
-            projection_caption = (
-                f"Dashed forecast band uses Solcast and Open-Meteo production estimates, "
-                f"with time-of-day average Sigen load (overall mean {average_load_kw:.2f} kW) "
-                "from the previous seven days. "
-                f"It assumes {SIGEN_BATTERY_CAPACITY_KWH:.0f} kWh usable capacity, 95% charge/discharge efficiency, "
-                "and does not model grid charging, export, or curtailment."
+                    if interval_end >= window_start:
+                        break
+                return soc
+
+            for period_index, period_start, period_end in scenario_period_slots:
+                if period_start < period_end and period_start >= latest_soc_time:
+                    scenario_soc_start_by_window[period_index] = (
+                        scenario_soc_at_window_start(period_start)
+                    )
+
+        # Bound each target by the scenario SOC remaining at that window's start.
+        scenario_max_sell_kwh_by_window = []
+        for period_index, period_start, period_end in scenario_period_slots:
+            start_soc = scenario_soc_start_by_window[period_index]
+            if start_soc is None:
+                scenario_max_sell_kwh_by_window.append(
+                    scenario_inverter_max_sell_kwh_by_window[period_index]
+                )
+                continue
+            available_battery_kwh = max(
+                0.0, start_soc / 100 * SIGEN_BATTERY_CAPACITY_KWH * 0.95,
             )
-    if not projection_caption:
-        projection_caption = (
-            "Forecast range needs a recent Sigen SOC reading, both forecast providers, "
-            "and recent Sigen load readings."
-        )
-    if projection_available:
-        day_end = soc_day_start + pd.DateOffset(days=1)
-        prior_state = projection_path[
-            projection_path["time_local"] <= soc_day_start
-        ].tail(1)
-        day_states = projection_path[
-            (projection_path["time_local"] > soc_day_start)
-            & (projection_path["time_local"] <= day_end)
+            scenario_max_sell_kwh_by_window.append(min(
+                scenario_inverter_max_sell_kwh_by_window[period_index],
+                available_battery_kwh,
+            ))
+        scenario_max_sell_pcts = [
+            min(100, int(np.floor(
+                max_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100 + 1e-9
+            )))
+            for max_kwh in scenario_max_sell_kwh_by_window
         ]
-        if not prior_state.empty:
-            prior_day_state = {
-                "time_local": [soc_day_start],
-                "soc_low": [prior_state.iloc[0]["soc_low"]],
-                "soc_high": [prior_state.iloc[0]["soc_high"]],
-                "soc_midpoint": [prior_state.iloc[0]["soc_midpoint"]],
-            }
-            if "soc_scenario" in projection_path:
-                prior_day_state["soc_scenario"] = [
-                    prior_state.iloc[0]["soc_scenario"]
-                ]
-            day_states = pd.concat([
-                pd.DataFrame(prior_day_state),
-                day_states,
-            ], ignore_index=True)
-        if not day_states.empty:
-            soc_fig.add_trace(go.Scatter(
-                x=day_states["time_local"], y=day_states["soc_low"],
-                mode="lines", name="Forecast range low",
-                line=dict(width=1, color="rgba(123,97,168,0.65)", dash="dot"),
-                hovertemplate="%{x|%H:%M}<br>Lower SOC: %{y:.1f}%<extra></extra>",
-            ))
-            soc_fig.add_trace(go.Scatter(
-                x=day_states["time_local"], y=day_states["soc_high"],
-                mode="lines", name="Forecast range high",
-                line=dict(width=1, color="rgba(123,97,168,0.65)", dash="dot"),
-                fill="tonexty", fillcolor="rgba(123,97,168,0.14)",
-                hovertemplate="%{x|%H:%M}<br>Upper SOC: %{y:.1f}%<extra></extra>",
-            ))
-            soc_fig.add_trace(go.Scatter(
-                x=day_states["time_local"], y=day_states["soc_midpoint"],
-                mode="lines", name="Forecast SOC midpoint",
-                line=dict(width=2, color="#7b61a8", dash="dot"),
-                hovertemplate="%{x|%H:%M}<br>Forecast SOC: %{y:.1f}%<extra></extra>",
-            ))
-            if "soc_scenario" in day_states:
+        scenario_sell_pcts = [0.0] * len(scenario_period_slots)
+        for window_index, (period_index, _, _) in enumerate(scenario_period_slots):
+            max_pct = scenario_max_sell_pcts[period_index]
+            with scenario_target_placeholders[period_index].container():
+                input_cols = st.columns([2, 1])
+                with input_cols[0]:
+                    raw_pct = st.text_input(
+                        f"Sell target for period {window_index + 1} (%)",
+                        value=st.session_state.get(
+                            f"battery_soc_scenario_sell_pct_{window_index + 1}",
+                            str(min(20, max_pct)),
+                        ),
+                        key=f"battery_soc_scenario_sell_pct_{window_index + 1}",
+                        help="Percentage of the 24 kWh battery to target during this sell period.",
+                    )
+                with input_cols[1]:
+                    _, period_start, period_end = scenario_period_slots[window_index]
+                    if period_start < period_end:
+                        period_window_text = (
+                            f"{period_start.strftime('%d %b %H:%M')}–"
+                            f"{period_end.strftime('%d %b %H:%M')}"
+                        )
+                    else:
+                        period_window_text = "Invalid time window"
+                    start_soc_text = (
+                        f"SOC at start {scenario_soc_start_by_window[period_index]:.1f}%"
+                        if scenario_soc_start_by_window[period_index] is not None
+                        else "SOC forecast unavailable"
+                    )
+                    st.markdown(
+                        f"**Maximum: {max_pct}%**  \n"
+                        f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
+                        f"{period_window_text}  ·  {start_soc_text}"
+                    )
+            try:
+                sell_pct = float(raw_pct.strip())
+                if not np.isfinite(sell_pct):
+                    raise ValueError
+            except (AttributeError, TypeError, ValueError):
+                sell_pct = 0.0
+                st.warning(f"Sell target for period {window_index + 1} must be a number; using 0%.")
+            if sell_pct < 0:
+                sell_pct = 0.0
+                st.warning(f"Sell target for period {window_index + 1} cannot be negative; using 0%.")
+            if sell_pct > max_pct:
+                sell_pct = float(max_pct)
+                st.warning(
+                    f"Sell target for period {window_index + 1} exceeds its maximum; "
+                    f"using {max_pct}%."
+                )
+            scenario_sell_pcts[period_index] = sell_pct
+        st.caption(
+            f"Estimated additional battery export capacity across the selected windows: "
+            f"{scenario_inverter_throughput_kwh:.1f} kWh. Per-window capacity: "
+            f"{', '.join(f'{value:.1f} kWh' for value in scenario_window_throughputs_kwh) or '—'}. "
+            f"Maximum target per window: "
+            f"{', '.join(f'{value:.1f} kWh ({pct}%)' for value, pct in zip(scenario_max_sell_kwh_by_window, scenario_max_sell_pcts)) or '—'}. "
+            f"Export limit assumed: "
+            f"{SIGEN_SITE_EXPORT_LIMIT_KW:.1f} kW. Set SIGEN_EXPORT_LIMIT_KW to your configured site limit."
+        )
+        battery_soc_intraday = battery_soc[
+            battery_soc["local_date"] == battery_soc_date
+        ].sort_values("period_end_local")
+        soc_fig = go.Figure()
+        soc_fig.add_trace(go.Scatter(
+            x=battery_soc_intraday["period_end_local"],
+            y=battery_soc_intraday["Battery state of charge (%)"],
+            mode="lines", name="Battery state of charge",
+            line=dict(width=2, color="#4c78a8"), connectgaps=False,
+            hovertemplate="%{x|%H:%M}<br>Battery SOC: %{y:.1f}%<extra></extra>",
+        ))
+        soc_day_start = pd.Timestamp(battery_soc_date).tz_localize(TZ_NAME)
+        projection_available = False
+        projection_caption = ""
+        now_local = pd.Timestamp.now(tz=TZ_NAME)
+        can_project_from_latest_soc = (
+            pd.Timedelta(0) <= now_local - latest_soc_time <= pd.Timedelta(hours=12)
+        )
+        projection_path = pd.DataFrame()
+        scenario_sale_revenue = 0.0
+        scenario_sold_kwh = 0.0
+        scenario_priced_kwh = 0.0
+        scenario_amber_price_lookup = pd.DataFrame()
+        if not amber_prices.empty:
+            scenario_amber_prices = amber_prices[
+                (amber_prices["channel_type"] == "feedIn")
+                & amber_prices["per_kwh"].notna()
+                & amber_prices["price_type"].str.lower().isin(
+                    ("actualinterval", "currentinterval", "forecastinterval")
+                )
+            ].copy()
+            if not scenario_amber_prices.empty:
+                scenario_amber_prices["_start_local"] = pd.to_datetime(
+                    scenario_amber_prices["start_time_local"]
+                )
+                scenario_amber_prices["_end_local"] = pd.to_datetime(
+                    scenario_amber_prices["end_time_local"]
+                )
+                scenario_amber_prices["_priority"] = scenario_amber_prices[
+                    "price_type"
+                ].str.lower().map({"actualinterval": 0, "currentinterval": 1, "forecastinterval": 2})
+                scenario_amber_prices["_duration_minutes"] = (
+                    (scenario_amber_prices["_end_local"]
+                     - scenario_amber_prices["_start_local"]).dt.total_seconds() / 60
+                )
+                bucket_rows = []
+                for _, price_row in scenario_amber_prices.iterrows():
+                    bucket_start = price_row["_start_local"].floor("5min")
+                    while bucket_start < price_row["_end_local"]:
+                        bucket_rows.append({
+                            "bucket_start": bucket_start,
+                            "per_kwh": float(price_row["per_kwh"]),
+                            "priority": int(price_row["_priority"]),
+                            "duration_minutes": float(price_row["_duration_minutes"]),
+                            "fetched_at_utc": price_row["fetched_at_utc"],
+                        })
+                        bucket_start += pd.Timedelta(minutes=5)
+                if bucket_rows:
+                    scenario_amber_price_lookup = (
+                        pd.DataFrame(bucket_rows)
+                        .sort_values(
+                            ["priority", "duration_minutes", "fetched_at_utc"],
+                            ascending=[True, True, False],
+                        )
+                        .drop_duplicates("bucket_start", keep="first")
+                        .set_index("bucket_start")
+                    )
+        if (can_project_from_latest_soc and not load_samples.empty
+                and not openmeteo_forecast_hourly.empty and not history.empty):
+            paired_generation = scenario_generation.copy()
+            if not paired_generation.empty:
+                current_soc = float(latest_soc["Battery state of charge (%)"])
+                low_soc = current_soc
+                high_soc = current_soc
+                midpoint_soc = current_soc
+                low_values, high_values, midpoint_values = [], [], []
+                for forecast_row in paired_generation.itertuples(index=False):
+                    slot = forecast_row.time_local.strftime("%H:%M")
+                    load_kw = float(load_profile.get(slot, average_load_kw))
+                    load_kwh = load_kw * 0.5
+                    solar_values = [max(0.0, float(forecast_row.solcast_kw)),
+                                    max(0.0, float(forecast_row.openmeteo_kw))]
+
+                    def advance_soc(soc, solar_kw):
+                        net_battery_kwh = solar_kw * 0.5 - load_kwh
+                        stored_kwh = net_battery_kwh * 0.95 if net_battery_kwh >= 0 else net_battery_kwh / 0.95
+                        return float(np.clip(
+                            soc + stored_kwh / SIGEN_BATTERY_CAPACITY_KWH * 100, 0, 100,
+                        ))
+
+                    low_soc = advance_soc(low_soc, min(solar_values))
+                    high_soc = advance_soc(high_soc, max(solar_values))
+                    midpoint_soc = advance_soc(midpoint_soc, sum(solar_values) / 2)
+                    low_values.append(low_soc)
+                    high_values.append(high_soc)
+                    midpoint_values.append(midpoint_soc)
+
+                projection_times = paired_generation["time_local"]
+                projection_times = pd.DatetimeIndex([latest_soc_time]).append(
+                    pd.DatetimeIndex(projection_times)
+                )
+                low_values = [current_soc, *low_values]
+                high_values = [current_soc, *high_values]
+                midpoint_values = [current_soc, *midpoint_values]
+                projection_path = pd.DataFrame({
+                    "time_local": projection_times,
+                    "soc_low": low_values,
+                    "soc_high": high_values,
+                    "soc_midpoint": midpoint_values,
+                })
+                if any(sell_pct > 0 for sell_pct in scenario_sell_pcts) and scenario_periods:
+                    target_sale_kwh_by_window = [
+                        SIGEN_BATTERY_CAPACITY_KWH * sell_pct / 100
+                        for sell_pct in scenario_sell_pcts
+                    ]
+                    window_sold_kwh = [0.0] * len(scenario_period_slots)
+                    scenario_soc = current_soc
+                    scenario_values = [scenario_soc]
+                    for forecast_row in paired_generation.itertuples(index=False):
+                        forecast_time = pd.Timestamp(forecast_row.time_local)
+                        slot = forecast_time.strftime("%H:%M")
+                        typical_load_kw = float(load_profile.get(slot, average_load_kw))
+                        solar_kw = min(
+                            SIGEN_INVERTER_LIMIT_KW,
+                            max(0.0, (float(forecast_row.solcast_kw)
+                                      + float(forecast_row.openmeteo_kw)) / 2),
+                        )
+                        interval_start = forecast_time - pd.Timedelta(minutes=30)
+                        sale_segments = []
+                        if forecast_time > latest_soc_time:
+                            for period_index, period_start, period_end in scenario_period_slots:
+                                if period_start >= period_end:
+                                    continue
+                                sale_start = max(interval_start, period_start)
+                                sale_end = min(forecast_time, period_end)
+                                if sale_start < sale_end:
+                                    sale_segments.append((period_index, sale_start, sale_end))
+                        sale_hours = sum(
+                            (sale_end - sale_start).total_seconds() / 3600
+                            for _, sale_start, sale_end in sale_segments
+                        )
+                        sale_period_active = sale_hours > 0
+                        battery_export_headroom_kw = 0.0
+                        if sale_period_active:
+                            max_total_export_kw = min(
+                                max(0.0, SIGEN_INVERTER_LIMIT_KW - typical_load_kw),
+                                SIGEN_SITE_EXPORT_LIMIT_KW,
+                            )
+                            solar_export_kw = min(
+                                max(0.0, solar_kw - typical_load_kw),
+                                max_total_export_kw,
+                            )
+                            battery_export_headroom_kw = max(
+                                0.0, max_total_export_kw - solar_export_kw,
+                            )
+                            net_battery_kwh = (
+                                (solar_kw - typical_load_kw)
+                                * (0.5 - sale_hours)
+                                + (solar_kw - typical_load_kw - solar_export_kw)
+                                * sale_hours
+                            )
+                        else:
+                            net_battery_kwh = (solar_kw - typical_load_kw) * 0.5
+                        if net_battery_kwh >= 0:
+                            scenario_soc += (
+                                net_battery_kwh * 0.95
+                                / SIGEN_BATTERY_CAPACITY_KWH * 100
+                            )
+                        else:
+                            scenario_soc += (
+                                net_battery_kwh / 0.95
+                                / SIGEN_BATTERY_CAPACITY_KWH * 100
+                            )
+                        scenario_soc = float(np.clip(scenario_soc, 0, 100))
+                        forecast_time = pd.Timestamp(forecast_time)
+                        if sale_period_active:
+                            for period_index, sale_start, sale_end in sale_segments:
+                                segment_hours = (sale_end - sale_start).total_seconds() / 3600
+                                available_ac_energy_kwh = (
+                                    scenario_soc / 100
+                                    * SIGEN_BATTERY_CAPACITY_KWH * 0.95
+                                )
+                                segment_sale_kwh = max(0.0, min(
+                                    battery_export_headroom_kw * segment_hours,
+                                    target_sale_kwh_by_window[period_index]
+                                    - window_sold_kwh[period_index],
+                                    available_ac_energy_kwh,
+                                ))
+                                window_sold_kwh[period_index] += segment_sale_kwh
+                                scenario_sold_kwh += segment_sale_kwh
+                                scenario_soc = max(
+                                    0.0,
+                                    scenario_soc - segment_sale_kwh / (
+                                        SIGEN_BATTERY_CAPACITY_KWH * 0.95
+                                    ) * 100,
+                                )
+                                if segment_sale_kwh > 0 and not scenario_amber_price_lookup.empty:
+                                    price_values = []
+                                    price_weights = []
+                                    price_start = sale_start.floor("5min")
+                                    while price_start < sale_end:
+                                        bucket_end = price_start + pd.Timedelta(minutes=5)
+                                        overlap_start = max(price_start, sale_start)
+                                        overlap_end = min(bucket_end, sale_end)
+                                        overlap_minutes = max(
+                                            0.0,
+                                            (overlap_end - overlap_start).total_seconds() / 60,
+                                        )
+                                        try:
+                                            bucket_price = scenario_amber_price_lookup.loc[
+                                                price_start, "per_kwh"
+                                            ]
+                                            if isinstance(bucket_price, pd.Series):
+                                                bucket_price = bucket_price.iloc[0]
+                                        except KeyError:
+                                            bucket_price = None
+                                        if bucket_price is not None and overlap_minutes > 0:
+                                            price_values.append(float(bucket_price))
+                                            price_weights.append(overlap_minutes)
+                                        price_start = bucket_end
+                                    if price_weights:
+                                        average_price_cents = float(np.average(
+                                            price_values, weights=price_weights,
+                                        ))
+                                        priced_fraction = min(
+                                            1.0,
+                                            sum(price_weights) / max(segment_hours * 60, 1e-9),
+                                        )
+                                        priced_sale_kwh = segment_sale_kwh * priced_fraction
+                                        scenario_sale_revenue += (
+                                            priced_sale_kwh * average_price_cents / 100
+                                        )
+                                        scenario_priced_kwh += priced_sale_kwh
+                        scenario_values.append(scenario_soc)
+                    projection_path["soc_scenario"] = scenario_values
+                projection_available = True
+                projection_caption = (
+                    f"Dashed forecast band uses Solcast and Open-Meteo production estimates, "
+                    f"with time-of-day average Sigen load (overall mean {average_load_kw:.2f} kW) "
+                    "from the previous seven days. "
+                    f"It assumes {SIGEN_BATTERY_CAPACITY_KWH:.0f} kWh usable capacity, 95% charge/discharge efficiency, "
+                    "and does not model grid charging, export, or curtailment."
+                )
+        if not projection_caption:
+            projection_caption = (
+                "Forecast range needs a recent Sigen SOC reading, both forecast providers, "
+                "and recent Sigen load readings."
+            )
+        if projection_available:
+            day_end = soc_day_start + pd.DateOffset(days=1)
+            prior_state = projection_path[
+                projection_path["time_local"] <= soc_day_start
+            ].tail(1)
+            day_states = projection_path[
+                (projection_path["time_local"] > soc_day_start)
+                & (projection_path["time_local"] <= day_end)
+            ]
+            if not prior_state.empty:
+                prior_day_state = {
+                    "time_local": [soc_day_start],
+                    "soc_low": [prior_state.iloc[0]["soc_low"]],
+                    "soc_high": [prior_state.iloc[0]["soc_high"]],
+                    "soc_midpoint": [prior_state.iloc[0]["soc_midpoint"]],
+                }
+                if "soc_scenario" in projection_path:
+                    prior_day_state["soc_scenario"] = [
+                        prior_state.iloc[0]["soc_scenario"]
+                    ]
+                day_states = pd.concat([
+                    pd.DataFrame(prior_day_state),
+                    day_states,
+                ], ignore_index=True)
+            if not day_states.empty:
                 soc_fig.add_trace(go.Scatter(
-                    x=day_states["time_local"], y=day_states["soc_scenario"],
-                    mode="lines", name="SOC scenario with battery sales",
-                    line=dict(width=2, color="#d62728", dash="dash"),
-                    hovertemplate="%{x|%H:%M}<br>Scenario SOC: %{y:.1f}%<extra></extra>",
+                    x=day_states["time_local"], y=day_states["soc_low"],
+                    mode="lines", name="Forecast range low",
+                    line=dict(width=1, color="rgba(123,97,168,0.65)", dash="dot"),
+                    hovertemplate="%{x|%H:%M}<br>Lower SOC: %{y:.1f}%<extra></extra>",
                 ))
-    soc_fig.update_layout(
-        xaxis_title="Time (Sydney)", yaxis_title="Battery state of charge (%)",
-        margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
-    )
-    soc_fig.update_yaxes(range=[0, 100], ticksuffix="%")
-    soc_fig.update_xaxes(
-        range=[soc_day_start, soc_day_start + pd.DateOffset(days=1)], fixedrange=True,
-    )
-    place_legend_below_chart(soc_fig)
-    st.plotly_chart(soc_fig, width="stretch")
-    st.caption("Battery SOC is read from the battery_soc column in sigen_energy_actuals. " + projection_caption)
-    if any(sell_pct > 0 for sell_pct in scenario_sell_pcts):
-        if not scenario_periods:
-            st.caption("Choose valid sell start and end dates and times to show the sales scenario.")
-        else:
-            scenario_window_labels = "; ".join(
-                f"{window_start.strftime('%d %b %Y %H:%M')}–{window_end.strftime('%d %b %Y %H:%M')}"
-                for window_start, window_end in scenario_periods
-            )
-            scenario_target_labels = "; ".join(
-                f"period {index + 1}: {sell_pct:g}% "
-                f"({SIGEN_BATTERY_CAPACITY_KWH * sell_pct / 100:.1f} kWh AC)"
-                for index, sell_pct in enumerate(scenario_sell_pcts)
-            )
-            st.caption(
-                f"Sales scenario targets {scenario_target_labels} "
-                f"during {scenario_window_labels} Sydney time. "
-                "Export is capped each 30-minute period by inverter and site export headroom after typical load and solar export; "
-                "the scenario line appears when a forecast SOC path is available."
-            )
-            predicted_sale_value = -scenario_sale_revenue
-            sale_value_label = (
-                f"-${abs(predicted_sale_value):,.2f}"
-                if predicted_sale_value < 0
-                else f"${predicted_sale_value:,.2f}"
-            ) if scenario_priced_kwh > 0 else "—"
-            priced_coverage = (
-                scenario_priced_kwh / scenario_sold_kwh * 100
-                if scenario_sold_kwh > 0 else 0.0
-            )
-            sale_metric_cols = st.columns(3)
-            sale_metric_cols[0].metric(
-                "Predicted Amber sale value", sale_value_label,
-                help="Estimated revenue from simulated battery export, using Amber feed-in prices for matching intervals.",
-            )
-            sale_metric_cols[1].metric("Scenario energy sold", f"{scenario_sold_kwh:.2f} kWh")
-            sale_metric_cols[2].metric("Energy with Amber prices", f"{priced_coverage:.0f}%")
-            st.caption(
-                "Sale value is an estimate using Amber feed-in prices (actual/current prices where available, "
-                "otherwise forecast prices). Unpriced intervals are excluded from the value."
-            )
+                soc_fig.add_trace(go.Scatter(
+                    x=day_states["time_local"], y=day_states["soc_high"],
+                    mode="lines", name="Forecast range high",
+                    line=dict(width=1, color="rgba(123,97,168,0.65)", dash="dot"),
+                    fill="tonexty", fillcolor="rgba(123,97,168,0.14)",
+                    hovertemplate="%{x|%H:%M}<br>Upper SOC: %{y:.1f}%<extra></extra>",
+                ))
+                soc_fig.add_trace(go.Scatter(
+                    x=day_states["time_local"], y=day_states["soc_midpoint"],
+                    mode="lines", name="Forecast SOC midpoint",
+                    line=dict(width=2, color="#7b61a8", dash="dot"),
+                    hovertemplate="%{x|%H:%M}<br>Forecast SOC: %{y:.1f}%<extra></extra>",
+                ))
+                if "soc_scenario" in day_states:
+                    soc_fig.add_trace(go.Scatter(
+                        x=day_states["time_local"], y=day_states["soc_scenario"],
+                        mode="lines", name="SOC scenario with battery sales",
+                        line=dict(width=2, color="#d62728", dash="dash"),
+                        hovertemplate="%{x|%H:%M}<br>Scenario SOC: %{y:.1f}%<extra></extra>",
+                    ))
+        soc_fig.update_layout(
+            xaxis_title="Time (Sydney)", yaxis_title="Battery state of charge (%)",
+            margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+        )
+        soc_fig.update_yaxes(range=[0, 100], ticksuffix="%")
+        soc_fig.update_xaxes(
+            range=[soc_day_start, soc_day_start + pd.DateOffset(days=1)], fixedrange=True,
+        )
+        place_legend_below_chart(soc_fig)
+        st.plotly_chart(soc_fig, width="stretch")
+        st.caption("Battery SOC is read from the battery_soc column in sigen_energy_actuals. " + projection_caption)
+        if any(sell_pct > 0 for sell_pct in scenario_sell_pcts):
+            if not scenario_periods:
+                st.caption("Choose valid sell start and end dates and times to show the sales scenario.")
+            else:
+                scenario_window_labels = "; ".join(
+                    f"{window_start.strftime('%d %b %Y %H:%M')}–{window_end.strftime('%d %b %Y %H:%M')}"
+                    for window_start, window_end in scenario_periods
+                )
+                scenario_target_labels = "; ".join(
+                    f"period {index + 1}: {sell_pct:g}% "
+                    f"({SIGEN_BATTERY_CAPACITY_KWH * sell_pct / 100:.1f} kWh AC)"
+                    for index, sell_pct in enumerate(scenario_sell_pcts)
+                )
+                st.caption(
+                    f"Sales scenario targets {scenario_target_labels} "
+                    f"during {scenario_window_labels} Sydney time. "
+                    "Export is capped each 30-minute period by inverter and site export headroom after typical load and solar export; "
+                    "the scenario line appears when a forecast SOC path is available."
+                )
+                predicted_sale_value = -scenario_sale_revenue
+                sale_value_label = (
+                    f"-${abs(predicted_sale_value):,.2f}"
+                    if predicted_sale_value < 0
+                    else f"${predicted_sale_value:,.2f}"
+                ) if scenario_priced_kwh > 0 else "—"
+                priced_coverage = (
+                    scenario_priced_kwh / scenario_sold_kwh * 100
+                    if scenario_sold_kwh > 0 else 0.0
+                )
+                sale_metric_cols = st.columns(3)
+                sale_metric_cols[0].metric(
+                    "Predicted Amber sale value", sale_value_label,
+                    help="Estimated revenue from simulated battery export, using Amber feed-in prices for matching intervals.",
+                )
+                sale_metric_cols[1].metric("Scenario energy sold", f"{scenario_sold_kwh:.2f} kWh")
+                sale_metric_cols[2].metric("Energy with Amber prices", f"{priced_coverage:.0f}%")
+                st.caption(
+                    "Sale value is an estimate using Amber feed-in prices (actual/current prices where available, "
+                    "otherwise forecast prices). Unpriced intervals are excluded from the value."
+                )
+
+
+_render_amber_and_battery_panels()
 
 if history.empty:
     st.info("No forecast data saved yet. Configure SOLCAST_API_KEY and choose **Download latest forecast**.")
