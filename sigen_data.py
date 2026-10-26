@@ -65,7 +65,9 @@ def _api_request(method, path, token=None, token_type=None, **kwargs):
         raise ValueError("Sigen API returned an unexpected response format.")
     if payload.get("code", 0) != 0:
         message = str(payload.get("msg") or "request failed")
-        raise RuntimeError(f"Sigen API error {payload.get('code')}: {message}")
+        raise RuntimeError(
+            f"Sigen API error {payload.get('code')} during {method.upper()} {path}: {message}"
+        )
     return payload
 
 

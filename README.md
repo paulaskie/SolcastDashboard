@@ -84,7 +84,7 @@ SIGEN_API_BASE_URL = "https://openapi-aus.sigencloud.com"
 SIGEN_SYSTEM_ID = "your-sigen-system-id"
 ```
 
-The app authenticates with the App Key and App Secret, then requests `GET /openapi/systems/{systemId}/history` at `level=Day` for the selected date. The Developer API permits one history request per station every five minutes, so the Streamlit control fetches one day at a time. The local Node-based flow remains available when these Developer API credentials are not configured. Keep the App Secret in Streamlit secrets; never commit it to GitHub.
+The app authenticates with the App Key and App Secret for each update, then requests `GET /openapi/systems/{systemId}/history` at `level=Day` for the selected date. It obtains a fresh access token on each update, so the token does not need to be manually renewed daily. The Developer API permits one history request per station every five minutes, so the Streamlit control fetches one day at a time. The local Node-based flow remains available when these Developer API credentials are not configured. Keep the App Secret in Streamlit secrets; never commit it to GitHub.
 
 ### Persistent Turso database
 
