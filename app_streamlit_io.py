@@ -1,7 +1,6 @@
 """Streamlit Community Cloud entry point for the dashboard."""
 
 import os
-import logging
 import runpy
 import time
 from pathlib import Path
@@ -9,9 +8,6 @@ from pathlib import Path
 import streamlit as st
 from database import USE_TURSO_ENV
 
-
-performance_logger = logging.getLogger("solcast.performance")
-performance_logger.setLevel(logging.INFO)
 
 APP_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = APP_DIR / "solcast_history.sqlite3"
@@ -68,18 +64,24 @@ if has_turso_url:
         try:
             snapshot_rows = pull_turso_snapshot(database_path)
         except Exception as error:
-            performance_logger.error(
+            print(
                 "PERF operation=turso_snapshot status=error error_type=%s "
-                "duration_seconds=%.3f",
-                type(error).__name__,
-                time.perf_counter() - snapshot_started_at,
+                "duration_seconds=%.3f"
+                % (
+                    type(error).__name__,
+                    time.perf_counter() - snapshot_started_at,
+                ),
+                flush=True,
             )
             raise
-        performance_logger.info(
-            "PERF operation=turso_snapshot tables=%d rows=%d duration_seconds=%.3f",
-            len(snapshot_rows),
-            sum(snapshot_rows.values()),
-            time.perf_counter() - snapshot_started_at,
+        print(
+            "PERF operation=turso_snapshot tables=%d rows=%d duration_seconds=%.3f"
+            % (
+                len(snapshot_rows),
+                sum(snapshot_rows.values()),
+                time.perf_counter() - snapshot_started_at,
+            ),
+            flush=True,
         )
         return snapshot_rows
 
@@ -95,7 +97,8 @@ dashboard_started_at = time.perf_counter()
 try:
     runpy.run_path(str(APP_DIR / "app.py"), run_name="__main__")
 finally:
-    performance_logger.info(
-        "PERF operation=dashboard_script duration_seconds=%.3f",
-        time.perf_counter() - dashboard_started_at,
+    print(
+        "PERF operation=dashboard_script duration_seconds=%.3f"
+        % (time.perf_counter() - dashboard_started_at),
+        flush=True,
     )

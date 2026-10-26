@@ -1,7 +1,6 @@
 import os
 import json
 import functools
-import logging
 import subprocess
 import sys
 import math
@@ -48,9 +47,6 @@ OPENMETEO_CALIBRATION_DATE = "2026-10-09"
 
 st.set_page_config(page_title="Solar Forecast", page_icon="☀️", layout="wide")
 
-performance_logger = logging.getLogger("solcast.performance")
-performance_logger.setLevel(logging.INFO)
-
 
 def log_performance(function):
     @functools.wraps(function)
@@ -59,17 +55,20 @@ def log_performance(function):
         try:
             result = function(*args, **kwargs)
         except Exception as error:
-            performance_logger.error(
-                "PERF operation=%s status=error error_type=%s duration_seconds=%.3f",
-                function.__name__,
-                type(error).__name__,
-                time.perf_counter() - started_at,
+            print(
+                "PERF operation=%s status=error error_type=%s duration_seconds=%.3f"
+                % (
+                    function.__name__,
+                    type(error).__name__,
+                    time.perf_counter() - started_at,
+                ),
+                flush=True,
             )
             raise
-        performance_logger.info(
-            "PERF operation=%s duration_seconds=%.3f",
-            function.__name__,
-            time.perf_counter() - started_at,
+        print(
+            "PERF operation=%s duration_seconds=%.3f"
+            % (function.__name__, time.perf_counter() - started_at),
+            flush=True,
         )
         return result
 
