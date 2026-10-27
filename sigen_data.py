@@ -1,6 +1,5 @@
 """Sigen Open Platform extraction and response parsing."""
 
-import base64
 import json
 import os
 import subprocess
@@ -18,7 +17,7 @@ SIGEN_MCP_SCRIPT = Path(os.getenv(
 
 
 def developer_api_configured():
-    return bool(os.getenv("SIGEN_APP_KEY", "").strip() and os.getenv("SIGEN_APP_SECRET", "").strip())
+    return bool(os.getenv("SIGEN_USERNAME", "").strip() and os.getenv("SIGEN_PASSWORD", "").strip())
 
 
 def _decode_api_data(value):
@@ -72,12 +71,15 @@ def _api_request(method, path, token=None, token_type=None, **kwargs):
 
 
 def _developer_api_token():
-    app_key = os.getenv("SIGEN_APP_KEY", "").strip()
-    app_secret = os.getenv("SIGEN_APP_SECRET", "").strip()
-    if not app_key or not app_secret:
-        raise RuntimeError("Set SIGEN_APP_KEY and SIGEN_APP_SECRET in Streamlit secrets.")
-    encoded = base64.b64encode(f"{app_key}:{app_secret}".encode("utf-8")).decode("ascii")
-    payload = _api_request("POST", "/openapi/auth/login/key", json={"key": encoded})
+    username = os.getenv("SIGEN_USERNAME", "").strip()
+    password = os.getenv("SIGEN_PASSWORD", "").strip()
+    if not username or not password:
+        raise RuntimeError("Set SIGEN_USERNAME and SIGEN_PASSWORD in Streamlit secrets.")
+    payload = _api_request(
+        "POST",
+        "/openapi/auth/login/password",
+        json={"username": username, "password": password},
+    )
     data = _decode_api_data(payload.get("data"))
     if not isinstance(data, dict) or not data.get("accessToken"):
         raise RuntimeError("Sigen authentication succeeded without returning an access token.")
