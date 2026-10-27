@@ -2353,6 +2353,7 @@ best = (
     if daily["Forecast_kWh"].notna().any() else None
 )
 
+st.subheader("Daily forecast generation")
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Today forecast + meter actual", f"{today_total_kwh:.1f} kWh" if today_total_kwh is not None else "—")
 k2.metric("Tomorrow forecast", f"{tomorrow_val.iloc[0]:.1f} kWh" if len(tomorrow_val) else "—")
@@ -2367,7 +2368,6 @@ if not history.empty:
 else:
     st.caption("Daily forecast bars use Open-Meteo because no Solcast forecast is saved.")
 
-st.subheader("Daily forecast generation")
 daily["Forecast_tooltip"] = daily["Forecast_kWh"].map(
     lambda value: f"{value:.2f} kWh" if pd.notna(value) else "—"
 )
