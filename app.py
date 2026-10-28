@@ -1040,19 +1040,9 @@ with st.sidebar:
 
     if turso_configured() and not turso_enabled():
         with st.expander("Database sync"):
-            st.caption(
-                "Upload only new or changed SQLite rows to Turso. Unchanged rows are skipped; "
-                "matching Turso rows are replaced and Turso-only records are retained. "
-                "A local database without a sync baseline needs one full initial upload."
-            )
-            upload_confirmed = st.checkbox(
-                "I understand changed local values replace matching Turso records",
-                key="confirm_local_turso_upload",
-            )
             upload_local_turso_clicked = st.button(
                 "Upload local database to Turso",
                 width="stretch",
-                disabled=not upload_confirmed,
             )
 
 if upload_local_turso_clicked:

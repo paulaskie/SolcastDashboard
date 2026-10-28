@@ -95,7 +95,7 @@ TURSO_DATABASE_URL = "your-database-url"
 TURSO_AUTH_TOKEN = "your-database-auth-token"
 ```
 
-On Streamlit Community Cloud, the app downloads a Turso snapshot into its local SQLite working copy once per app process. Dashboard reads and refreshes then use SQLite; changes are sent to Turso only when **Upload local database to Turso** is pressed and confirmed. A restart loads a fresh snapshot. Local runs use SQLite by default for faster access, even if Turso credentials are present in the environment. To deliberately use Turso directly from a local PowerShell session, set `$env:SOLCAST_USE_TURSO = "1"` before starting the app. Set both credentials; a partial configuration is reported as an error. Keep the auth token private.
+On Streamlit Community Cloud, the app downloads a Turso snapshot into its local SQLite working copy once per app process. Dashboard reads and refreshes then use SQLite; changes are sent to Turso when **Upload local database to Turso** is pressed. A restart loads a fresh snapshot. Local runs use SQLite by default for faster access, even if Turso credentials are present in the environment. To deliberately use Turso directly from a local PowerShell session, set `$env:SOLCAST_USE_TURSO = "1"` before starting the app. Set both credentials; a partial configuration is reported as an error. Keep the auth token private.
 
 To copy the bundled history to a new, empty Turso database before deployment, run the migration utility locally in PowerShell. Set the URL and token in your current PowerShell session (do not commit them), then run:
 
@@ -115,7 +115,7 @@ $env:TURSO_AUTH_TOKEN = "your-database-auth-token"
 .\run_streamlit.bat
 ```
 
-Then use **Database sync → Upload local database to Turso** and confirm before uploading. The sync uploads only rows that are new or changed since the last sync; unchanged rows are skipped, changed local rows replace matching Turso records, and Turso-only rows remain. Rows are not deleted. A local database without a sync baseline performs one full initial upload; Streamlit Cloud builds its baseline from the Turso snapshot loaded at startup. Cloud dashboard refreshes remain local until upload is confirmed. To use Turso directly for local reads and writes instead, opt in with `$env:SOLCAST_USE_TURSO = "1"`; expect database operations to depend on network latency.
+Then use **Database sync → Upload local database to Turso**. The sync uploads only rows that are new or changed since the last sync; unchanged rows are skipped, changed local rows replace matching Turso records, and Turso-only rows remain. Rows are not deleted. A local database without a sync baseline performs one full initial upload; Streamlit Cloud builds its baseline from the Turso snapshot loaded at startup. Cloud dashboard refreshes remain local until upload. To use Turso directly for local reads and writes instead, opt in with `$env:SOLCAST_USE_TURSO = "1"`; expect database operations to depend on network latency.
 
 `SOLCAST_API_KEY` enables Solcast forecast and estimated-actual downloads. `AMBER_API_KEY` enables Amber price updates. `SIGEN_EXPORT_LIMIT_KW` is an optional site export-limit assumption used by the battery-sale estimate; it defaults to `10` kW. Open-Meteo does not require an API key. Never put these values in GitHub or a committed `secrets.toml` file.
 
