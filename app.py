@@ -972,59 +972,60 @@ with st.sidebar:
             pd.Timestamp.now(tz=TZ_NAME).date() - timedelta(days=1)
         )
         openmeteo_default_start_date = openmeteo_latest_archive_date - timedelta(days=12)
-        openmeteo_start_date = date_picker_with_arrows(
-            "Archive start date", value=openmeteo_default_start_date,
-            key="openmeteo_archive_start_date", max_value=openmeteo_latest_archive_date,
-        )
-        openmeteo_end_date = date_picker_with_arrows(
-            "Archive end date", value=openmeteo_latest_archive_date,
-            key="openmeteo_archive_end_date", min_value=openmeteo_start_date,
-            max_value=openmeteo_latest_archive_date,
-        )
-        openmeteo_refresh_clicked = st.button(
-            "Refresh archive and forecast", width="stretch",
-            help="Refreshes the selected satellite archive and historical forecast dates, then fetches a 7-day weather forecast.",
-        )
+        with st.form("openmeteo_refresh_form"):
+            openmeteo_start_date = st.date_input(
+                "Archive start date", value=openmeteo_default_start_date,
+                key="openmeteo_archive_start_date", max_value=openmeteo_latest_archive_date,
+            )
+            openmeteo_end_date = st.date_input(
+                "Archive end date", value=openmeteo_latest_archive_date,
+                key="openmeteo_archive_end_date", max_value=openmeteo_latest_archive_date,
+            )
+            openmeteo_refresh_clicked = st.form_submit_button(
+                "Refresh archive and forecast", width="stretch",
+                help="Refreshes the selected satellite archive and historical forecast dates, then fetches a 7-day weather forecast.",
+            )
 
     with st.expander("Sigen actuals"):
-        if sigen_developer_api_configured():
-            sigen_start_date = date_picker_with_arrows(
-                "History date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_api_history_date",
+        with st.form("sigen_update_form"):
+            if sigen_developer_api_configured():
+                sigen_start_date = st.date_input(
+                    "History date", value=pd.Timestamp.now(tz=TZ_NAME).date(),
+                    key="sigen_api_history_date",
+                )
+                sigen_end_date = sigen_start_date
+                st.caption(
+                    "Using the Sigen Developer API. It limits history access to one request per station "
+                    "every five minutes, so update one day at a time."
+                )
+            else:
+                st.caption(f"Station {SIGEN_STATION_ID}")
+                sigen_start_date = st.date_input(
+                    "Start date", value=pd.Timestamp("2026-10-01").date(), key="sigen_start_date",
+                )
+                sigen_end_date = st.date_input(
+                    "End date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_end_date",
+                )
+            sigen_update_clicked = st.form_submit_button(
+                "Update power actuals", width="stretch",
+                help=(
+                    "Reads the selected day's five-minute Sigen power history from the Developer API."
+                    if sigen_developer_api_configured() else
+                    "Reads five-minute Sigen power through the selected end date using the installed Sigen client."
+                ),
             )
-            sigen_end_date = sigen_start_date
-            st.caption(
-                "Using the Sigen Developer API. It limits history access to one request per station "
-                "every five minutes, so update one day at a time."
-            )
-        else:
-            st.caption(f"Station {SIGEN_STATION_ID}")
-            sigen_start_date = date_picker_with_arrows(
-                "Start date", value=pd.Timestamp("2026-10-01").date(), key="sigen_start_date",
-            )
-            sigen_end_date = date_picker_with_arrows(
-                "End date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="sigen_end_date",
-                min_value=sigen_start_date,
-            )
-        sigen_update_clicked = st.button(
-            "Update power actuals", width="stretch",
-            disabled=sigen_end_date < sigen_start_date,
-            help=(
-                "Reads the selected day's five-minute Sigen power history from the Developer API."
-                if sigen_developer_api_configured() else
-                "Reads five-minute Sigen power through the selected end date using the installed Sigen client."
-            ),
-        )
 
     with st.expander("Amber prices"):
         amber_api_key = os.getenv("AMBER_API_KEY", "").strip()
         st.caption(f"API key {'ready' if amber_api_key else 'missing'}")
-        amber_date = date_picker_with_arrows(
-            "Price date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="amber_fetch_date",
-        )
-        amber_fetch_clicked = st.button(
-            "Fetch date and forecast", width="stretch", disabled=not bool(amber_api_key),
-            help="Fetches the selected date and requests up to 48 hours of current-price forecasts.",
-        )
+        with st.form("amber_fetch_form"):
+            amber_date = st.date_input(
+                "Price date", value=pd.Timestamp.now(tz=TZ_NAME).date(), key="amber_fetch_date",
+            )
+            amber_fetch_clicked = st.form_submit_button(
+                "Fetch date and forecast", width="stretch", disabled=not bool(amber_api_key),
+                help="Fetches the selected date and requests up to 48 hours of current-price forecasts.",
+            )
         amber_48_clicked = st.button(
             "Fetch next 48 intervals", width="stretch", disabled=not bool(amber_api_key),
         )
@@ -1078,7 +1079,7 @@ if upload_local_turso_clicked:
     except Exception as error:
         st.error(f"Could not upload local database to Turso: {error}")
 
-if openmeteo_refresh_clicked:
+if openmeteo_refresh_clicked and openmeteo_end_date >= openmeteo_start_date:
     try:
         with st.spinner(
             f"Refreshing Open-Meteo archive from {openmeteo_start_date} to "
@@ -1106,6 +1107,8 @@ if openmeteo_refresh_clicked:
             st.rerun()
     except Exception as e:
         st.error(f"Could not refresh Open-Meteo data: {e}")
+elif openmeteo_refresh_clicked:
+    st.error("Archive end date must be on or after the start date.")
 
 if st.session_state.get("openmeteo_refresh_message"):
     st.success(st.session_state.pop("openmeteo_refresh_message"))
@@ -1181,7 +1184,7 @@ if amber_48_clicked:
     except Exception as e:
         st.error(str(e))
 
-if sigen_update_clicked:
+if sigen_update_clicked and sigen_end_date >= sigen_start_date:
     try:
         with st.spinner("Updating meter actuals from Sigen…"):
             sigen_energy, sigen_power, sigen_quota = fetch_sigen_actuals(
@@ -1198,6 +1201,8 @@ if sigen_update_clicked:
         st.rerun()
     except Exception as e:
         st.error(f"Could not update actuals from Sigen: {e}")
+elif sigen_update_clicked:
+    st.error("Sigen end date must be on or after the start date.")
 
 if st.session_state.get("sigen_update_message"):
     st.success(st.session_state.pop("sigen_update_message"))
