@@ -2792,7 +2792,11 @@ def _render_openmeteo_power_by_time():
         openmeteo_historical_forecast_hourly[
             openmeteo_historical_forecast_hourly["local_date"] == openmeteo_chosen_date
         ].copy()
-        if openmeteo_chosen_date is not None and not openmeteo_historical_forecast_hourly.empty
+        if (
+            openmeteo_chosen_date is not None
+            and openmeteo_chosen_date >= "2026-10-01"
+            and not openmeteo_historical_forecast_hourly.empty
+        )
         else pd.DataFrame()
     )
     meter_openmeteo_intraday = (
@@ -2801,9 +2805,14 @@ def _render_openmeteo_power_by_time():
     )
     openmeteo_aligned_to_actuals = pd.DataFrame()
     openmeteo_forecast_comparison = (
-        openmeteo_historical_forecast_intraday
-        if not openmeteo_historical_forecast_intraday.empty
-        else openmeteo_forecast_intraday
+        openmeteo_forecast_intraday
+        if not openmeteo_forecast_intraday.empty
+        else openmeteo_historical_forecast_intraday
+    )
+    openmeteo_forecast_source = (
+        "weather forecast"
+        if not openmeteo_forecast_intraday.empty
+        else "historical forecast"
     )
     if not openmeteo_forecast_comparison.empty and not meter_openmeteo_intraday.empty:
         weather_power = openmeteo_forecast_comparison.set_index("time_local")[[
@@ -2846,17 +2855,13 @@ def _render_openmeteo_power_by_time():
             )
 
     full_day_source = None
-    full_day_frame = openmeteo_forecast_intraday
+    full_day_frame = openmeteo_forecast_comparison
     if not full_day_frame.empty:
-        full_day_source = "Forecast"
+        full_day_source = openmeteo_forecast_source.title()
     else:
         full_day_frame = openmeteo_intraday
         if not full_day_frame.empty:
             full_day_source = "Satellite archive"
-        else:
-            full_day_frame = openmeteo_historical_forecast_intraday
-            if not full_day_frame.empty:
-                full_day_source = "Historical forecast"
 
     full_day_estimate_kwh = None
     openmeteo_generated_date = None
@@ -2908,10 +2913,8 @@ def _render_openmeteo_power_by_time():
         st.caption("No matching Open-Meteo forecast and Sigen timestamps are available for this date, so the energy comparison and accuracy score are unavailable.")
 
     forecast_frequency_source = (
-        openmeteo_forecast_intraday
-        if not openmeteo_forecast_intraday.empty
-        else openmeteo_historical_forecast_intraday
-        if not openmeteo_historical_forecast_intraday.empty
+        openmeteo_forecast_comparison
+        if not openmeteo_forecast_comparison.empty
         else openmeteo_intraday
     )
     sigen_30min_actuals = (
@@ -2952,28 +2955,20 @@ def _render_openmeteo_power_by_time():
             hovertemplate="%{x|%H:%M}<br>Open-Meteo estimate: %{y:.2f} kW"
                           "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
         ))
-    if not openmeteo_historical_forecast_intraday.empty:
-        plotted_historical_forecast = openmeteo_historical_forecast_intraday
-        fig3.add_trace(go.Scatter(
-            x=plotted_historical_forecast["time_local"],
-            y=plotted_historical_forecast["openmeteo_power_kw"],
-            mode="lines", name="Open-Meteo historical forecast estimate (kW)",
-            line=dict(width=2, color="#7b61a8", dash="dash"),
-            customdata=plotted_historical_forecast["weighted_panel_irradiance"],
-            hovertemplate=(
-                "%{x|%H:%M}<br>Open-Meteo historical forecast: %{y:.2f} kW"
-                "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
-            ),
-        ))
-    if not openmeteo_forecast_intraday.empty:
-        # Keep every forecast hour visible; Sigen actuals can cover only part of today.
-        plotted_forecast = openmeteo_forecast_intraday
+    if not openmeteo_forecast_comparison.empty:
+        # Keep the selected forecast visible even when Sigen actuals cover only part of today.
+        plotted_forecast = openmeteo_forecast_comparison
+        forecast_label = (
+            "historical forecast"
+            if openmeteo_forecast_intraday.empty
+            else "weather forecast"
+        )
         fig3.add_trace(go.Scatter(
             x=plotted_forecast["time_local"], y=plotted_forecast["openmeteo_power_kw"],
-            mode="lines", name="Open-Meteo weather forecast estimate (kW)",
+            mode="lines", name=f"Open-Meteo {forecast_label} estimate (kW)",
             line=dict(width=2, color="#7b61a8", dash="dash"),
             customdata=plotted_forecast["weighted_panel_irradiance"],
-            hovertemplate="%{x|%H:%M}<br>Open-Meteo forecast estimate: %{y:.2f} kW"
+            hovertemplate=f"%{{x|%H:%M}}<br>Open-Meteo {forecast_label}: %{{y:.2f}} kW"
                           "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
         ))
     if (meter_openmeteo_intraday.empty and openmeteo_intraday.empty
