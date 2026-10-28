@@ -1840,7 +1840,7 @@ def _render_amber_and_battery_panels():
         for window_index, (period_index, _, _) in enumerate(scenario_period_slots):
             max_pct = scenario_max_sell_pcts[period_index]
             with scenario_target_placeholders[period_index].container():
-                input_cols = st.columns([2, 1])
+                input_cols = st.columns([1, 3], vertical_alignment="center")
                 with input_cols[0]:
                     raw_pct = st.text_input(
                         f"Sell target for period {window_index + 1} (%)",
@@ -1866,7 +1866,10 @@ def _render_amber_and_battery_panels():
                         else "SOC forecast unavailable"
                     )
                     st.markdown(
-                        f"**Maximum: {max_pct}%**  \n"
+                        f"**Maximum: {max_pct}%**",
+                        text_alignment="right",
+                    )
+                    st.markdown(
                         f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
                         f"{period_window_text}  ·  {start_soc_text}"
                     )
