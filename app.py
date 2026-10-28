@@ -44,6 +44,7 @@ SIGEN_INVERTER_LIMIT_KW = 10.0
 SIGEN_SITE_EXPORT_LIMIT_KW = max(0.0, float(os.getenv("SIGEN_EXPORT_LIMIT_KW", "10")))
 OPENMETEO_DEFAULT_PERFORMANCE_RATIO = 0.80
 OPENMETEO_CALIBRATION_DATE = "2026-10-09"
+OPENMETEO_CALIBRATION_MIN_SAMPLES = 10
 
 st.set_page_config(page_title="Solar Forecast", page_icon="☀️", layout="wide")
 
@@ -677,7 +678,7 @@ def prepare_openmeteo_estimates(weather):
 
 @log_performance
 def calibrate_openmeteo_performance_ratio(archive_weather, meter_power):
-    """Fit a fixed PV performance ratio from matching archive and meter samples."""
+    """Fit a fixed PV performance ratio from matching 30-minute means."""
     if archive_weather.empty or meter_power.empty:
         return OPENMETEO_DEFAULT_PERFORMANCE_RATIO, 0, 0
 
@@ -691,27 +692,37 @@ def calibrate_openmeteo_performance_ratio(archive_weather, meter_power):
         .interpolate(method="time", limit_area="inside")
         .reindex(meter_times)["weighted_panel_irradiance"]
     )
-    base_power_kw = pd.to_numeric(aligned_irradiance, errors="coerce") * (
-        PV_SYSTEM_CAPACITY_KW / 1000
+    calibration_samples = pd.DataFrame({
+        "base_power_kw": pd.to_numeric(aligned_irradiance, errors="coerce").to_numpy()
+        * (PV_SYSTEM_CAPACITY_KW / 1000),
+        "actual_power_kw": pd.to_numeric(
+            meter_power["Solar Production (kW)"], errors="coerce",
+        ).to_numpy(),
+    }, index=meter_times).dropna()
+    day_start = pd.Timestamp(OPENMETEO_CALIBRATION_DATE).tz_localize(TZ_NAME)
+    calibration_bins = (
+        calibration_samples.resample(
+            "30min", origin=day_start, closed="right", label="right",
+        )
+        .agg(["mean", "count"])
     )
-    actual_power_kw = pd.to_numeric(meter_power["Solar Production (kW)"], errors="coerce")
-    calibration = pd.DataFrame({
-        "time_local": meter_times,
-        "base_power_kw": base_power_kw.to_numpy(),
-        "actual_power_kw": actual_power_kw.to_numpy(),
-    }).dropna()
-    # Exclude night and very low-light samples, where inverter startup and meter
-    # resolution can dominate the ratio.
-    calibration = calibration[calibration["base_power_kw"] >= 0.2]
-    calibration = calibration[
-        calibration["time_local"].dt.date == pd.Timestamp(OPENMETEO_CALIBRATION_DATE).date()
+    calibration = calibration_bins[
+        (calibration_bins[("base_power_kw", "count")] == 6)
+        & (calibration_bins[("actual_power_kw", "count")] == 6)
     ]
-    day_count = calibration["time_local"].dt.date.nunique()
-    if len(calibration) < 50 or day_count != 1:
+    calibration = calibration[
+        (calibration.index.date == day_start.date())
+        & (calibration[("base_power_kw", "mean")] >= 0.2)
+    ]
+    calibration = calibration[
+        calibration[("actual_power_kw", "mean")].notna()
+    ]
+    day_count = calibration.index.normalize().nunique()
+    if len(calibration) < OPENMETEO_CALIBRATION_MIN_SAMPLES or day_count != 1:
         return OPENMETEO_DEFAULT_PERFORMANCE_RATIO, len(calibration), day_count
 
-    base = calibration["base_power_kw"].to_numpy()
-    actual = calibration["actual_power_kw"].to_numpy()
+    base = calibration[("base_power_kw", "mean")].to_numpy()
+    actual = calibration[("actual_power_kw", "mean")].to_numpy()
     fitted_ratio = float(np.dot(base, actual) / np.dot(base, base))
     # Guard against invalid telemetry or an incorrect system-capacity setting.
     fitted_ratio = float(np.clip(fitted_ratio, 0.30, 1.00))
@@ -2711,15 +2722,20 @@ _render_solcast_power_by_time()
 @log_performance
 def _render_openmeteo_power_by_time():
     st.subheader("Open-Meteo estimated and actual power by time")
-    if performance_ratio_samples >= 50 and performance_ratio_days == 1:
+    if (
+        performance_ratio_samples >= OPENMETEO_CALIBRATION_MIN_SAMPLES
+        and performance_ratio_days == 1
+    ):
         performance_ratio_caption = (
             f"a calibrated {openmeteo_performance_ratio:.3f} ratio from "
-            f"{performance_ratio_samples:,} daylight samples on {OPENMETEO_CALIBRATION_DATE}"
+            f"{performance_ratio_samples:,} daylight 30-minute means on "
+            f"{OPENMETEO_CALIBRATION_DATE}"
         )
     else:
         performance_ratio_caption = (
             f"the default {OPENMETEO_DEFAULT_PERFORMANCE_RATIO:.2f} ratio "
-            f"(need 50 matching daylight samples on {OPENMETEO_CALIBRATION_DATE} to calibrate)"
+            f"(need {OPENMETEO_CALIBRATION_MIN_SAMPLES} matching daylight 30-minute means "
+            f"on {OPENMETEO_CALIBRATION_DATE} to calibrate)"
         )
     st.caption(
         "Open-Meteo estimates weight 22° north- and east-facing tilted irradiance by panel count "
