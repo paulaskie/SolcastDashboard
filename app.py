@@ -1026,14 +1026,6 @@ with st.sidebar:
                 "Fetch date and forecast", width="stretch", disabled=not bool(amber_api_key),
                 help="Fetches the selected date and requests up to 48 hours of current-price forecasts.",
             )
-        amber_48_clicked = st.button(
-            "Fetch next 48 intervals", width="stretch", disabled=not bool(amber_api_key),
-        )
-        amber_update_actuals_clicked = st.button(
-            "Update actual prices through now", width="stretch",
-            disabled=not bool(amber_api_key),
-            help="Fetches actual intervals from the latest saved CurrentInterval through now.",
-        )
 
     if turso_configured() and not turso_enabled():
         with st.expander("Database sync"):
@@ -1143,46 +1135,6 @@ if st.session_state.get("amber_download_message"):
     st.success(st.session_state.pop("amber_download_message"))
 if st.session_state.get("amber_rate_limit_message"):
     st.caption(st.session_state.pop("amber_rate_limit_message"))
-
-if amber_update_actuals_clicked:
-    try:
-        with st.spinner("Updating Amber actual prices through now…"):
-            amber_updated_count, rate_limit_remaining = refresh_amber_actuals_since_last_current(
-                amber_api_key, include_rate_limit=True,
-            )
-        st.session_state["amber_download_message"] = (
-            f"Updated {amber_updated_count:,} actual Amber price intervals since the last CurrentInterval."
-        )
-        st.session_state["amber_rate_limit_message"] = amber_rate_limit_message(
-            prices=rate_limit_remaining,
-        )
-        st.rerun()
-    except requests.RequestException as e:
-        show_amber_rate_limit_from_error(e)
-        st.error(f"Could not contact Amber: {e}")
-    except Exception as e:
-        st.error(str(e))
-
-if amber_48_clicked:
-    try:
-        with st.spinner("Fetching the next 48 five-minute periods from Amber…"):
-            amber_48_rows, rate_limit_remaining = fetch_amber_current_prices(
-                amber_api_key, next_intervals=48, include_rate_limit=True,
-            )
-            save_amber_prices(amber_48_rows)
-        forecast_count = sum(1 for row in amber_48_rows if row.get("type") == "ForecastInterval")
-        st.session_state["amber_download_message"] = (
-            f"Saved {forecast_count} forecast intervals from Amber's next-48-period current-prices feed."
-        )
-        st.session_state["amber_rate_limit_message"] = amber_rate_limit_message(
-            current_prices=rate_limit_remaining,
-        )
-        st.rerun()
-    except requests.RequestException as e:
-        show_amber_rate_limit_from_error(e)
-        st.error(f"Could not contact Amber: {e}")
-    except Exception as e:
-        st.error(str(e))
 
 if sigen_update_clicked and sigen_end_date >= sigen_start_date:
     try:
