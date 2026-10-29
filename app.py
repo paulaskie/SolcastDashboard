@@ -1793,7 +1793,7 @@ def _render_amber_and_battery_panels():
         for window_index, (period_index, _, _) in enumerate(scenario_period_slots):
             max_pct = scenario_max_sell_pcts[period_index]
             with scenario_target_placeholders[period_index].container():
-                input_cols = st.columns([1, 3], vertical_alignment="center")
+                input_cols = st.columns([3, 1], vertical_alignment="bottom")
                 _, period_start, period_end = scenario_period_slots[window_index]
                 if period_start < period_end:
                     period_window_text = (
@@ -1825,10 +1825,10 @@ def _render_amber_and_battery_panels():
                         f"**Maximum: {max_pct}%**",
                         text_alignment="right",
                     )
-                    st.markdown(
-                        f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
-                        f"{period_window_text}  ·  {start_soc_text}"
-                    )
+                st.markdown(
+                    f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
+                    f"{period_window_text}  ·  {start_soc_text}"
+                )
             try:
                 sell_pct = float(raw_pct.strip())
                 if not np.isfinite(sell_pct):
