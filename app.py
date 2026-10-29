@@ -1825,10 +1825,11 @@ def _render_amber_and_battery_panels():
                         f"**Maximum: {max_pct}%**",
                         text_alignment="left",
                     )
-                st.markdown(
-                    f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
-                    f"{period_window_text}  ·  {start_soc_text}"
-                )
+                with input_cols[2]:
+                    st.markdown(
+                        f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
+                        f"{period_window_text}  ·  {start_soc_text}"
+                    )
             try:
                 sell_pct = float(raw_pct.strip())
                 if not np.isfinite(sell_pct):
