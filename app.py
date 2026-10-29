@@ -1794,30 +1794,33 @@ def _render_amber_and_battery_panels():
             max_pct = scenario_max_sell_pcts[period_index]
             with scenario_target_placeholders[period_index].container():
                 input_cols = st.columns([1, 3], vertical_alignment="center")
+                _, period_start, period_end = scenario_period_slots[window_index]
+                if period_start < period_end:
+                    period_window_text = (
+                        f"{period_start.strftime('%d %b %H:%M')}–"
+                        f"{period_end.strftime('%d %b %H:%M')}"
+                    )
+                else:
+                    period_window_text = "Invalid time window"
+                start_soc_text = (
+                    f"SOC at start {scenario_soc_start_by_window[period_index]:.1f}%"
+                    if scenario_soc_start_by_window[period_index] is not None
+                    else "SOC forecast unavailable"
+                )
                 with input_cols[0]:
+                    target_label = f"Sell target for period {window_index + 1} (%)"
+                    st.markdown(f"**{target_label}**")
                     raw_pct = st.text_input(
-                        f"Sell target for period {window_index + 1} (%)",
+                        target_label,
                         value=st.session_state.get(
                             f"battery_soc_scenario_sell_pct_{window_index + 1}",
                             str(min(20, max_pct)),
                         ),
                         key=f"battery_soc_scenario_sell_pct_{window_index + 1}",
                         help="Percentage of the 24 kWh battery to target during this sell period.",
+                        label_visibility="collapsed",
                     )
                 with input_cols[1]:
-                    _, period_start, period_end = scenario_period_slots[window_index]
-                    if period_start < period_end:
-                        period_window_text = (
-                            f"{period_start.strftime('%d %b %H:%M')}–"
-                            f"{period_end.strftime('%d %b %H:%M')}"
-                        )
-                    else:
-                        period_window_text = "Invalid time window"
-                    start_soc_text = (
-                        f"SOC at start {scenario_soc_start_by_window[period_index]:.1f}%"
-                        if scenario_soc_start_by_window[period_index] is not None
-                        else "SOC forecast unavailable"
-                    )
                     st.markdown(
                         f"**Maximum: {max_pct}%**",
                         text_alignment="right",
@@ -1874,6 +1877,7 @@ def _render_amber_and_battery_panels():
         scenario_sale_revenue = 0.0
         scenario_sold_kwh = 0.0
         scenario_priced_kwh = 0.0
+        scenario_used_previous_day_prices = False
         scenario_amber_price_lookup = pd.DataFrame()
         if not amber_prices.empty:
             scenario_amber_prices = amber_prices[
@@ -2068,6 +2072,19 @@ def _render_amber_and_battery_panels():
                                                 bucket_price = bucket_price.iloc[0]
                                         except KeyError:
                                             bucket_price = None
+                                        if bucket_price is None and overlap_minutes > 0:
+                                            previous_day_bucket = (
+                                                price_start - pd.DateOffset(days=1)
+                                            )
+                                            try:
+                                                bucket_price = scenario_amber_price_lookup.loc[
+                                                    previous_day_bucket, "per_kwh"
+                                                ]
+                                                if isinstance(bucket_price, pd.Series):
+                                                    bucket_price = bucket_price.iloc[0]
+                                                scenario_used_previous_day_prices = True
+                                            except KeyError:
+                                                bucket_price = None
                                         if bucket_price is not None and overlap_minutes > 0:
                                             price_values.append(float(bucket_price))
                                             price_weights.append(overlap_minutes)
@@ -2187,6 +2204,8 @@ def _render_amber_and_battery_panels():
                     if predicted_sale_value < 0
                     else f"${predicted_sale_value:,.2f}"
                 ) if scenario_priced_kwh > 0 else "—"
+                if scenario_used_previous_day_prices and scenario_priced_kwh > 0:
+                    sale_value_label += "*"
                 priced_coverage = (
                     scenario_priced_kwh / scenario_sold_kwh * 100
                     if scenario_sold_kwh > 0 else 0.0
@@ -2202,6 +2221,10 @@ def _render_amber_and_battery_panels():
                     "Sale value is an estimate using Amber feed-in prices (actual/current prices where available, "
                     "otherwise forecast prices). Unpriced intervals are excluded from the value."
                 )
+                if scenario_used_previous_day_prices and scenario_priced_kwh > 0:
+                    st.caption(
+                        "* Previous-day Amber feed-in prices were used for missing sell-period intervals."
+                    )
 
 
 _render_amber_and_battery_panels()
