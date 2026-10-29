@@ -2336,9 +2336,17 @@ best = (
     daily.loc[daily["Forecast_kWh"].idxmax()]
     if daily["Forecast_kWh"].notna().any() else None
 )
+month_start = pd.Timestamp(today).replace(day=1).date().isoformat()
+month_to_date_kwh = None
+if not energy_actuals.empty:
+    month_to_date_actuals = energy_actuals.loc[
+        energy_actuals["local_date"].between(month_start, today),
+        "Total Solar Production Energy (kWh)",
+    ]
+    month_to_date_kwh = pd.to_numeric(month_to_date_actuals, errors="coerce").sum(min_count=1)
 
 st.subheader("Daily forecast generation")
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Today forecast + meter actual", f"{today_total_kwh:.1f} kWh" if today_total_kwh is not None else "—")
 k2.metric("Tomorrow forecast", f"{tomorrow_val.iloc[0]:.1f} kWh" if len(tomorrow_val) else "—")
 k3.metric("Best forecast day", f"{best['Forecast_kWh']:.1f} kWh" if best is not None else "—",
@@ -2346,6 +2354,11 @@ k3.metric("Best forecast day", f"{best['Forecast_kWh']:.1f} kWh" if best is not 
 k4.metric(
     "Peak forecast power",
     f"{daily['Peak_kW'].max():.2f} kW" if daily["Peak_kW"].notna().any() else "—",
+)
+k5.metric(
+    "Sigen production since 1st",
+    f"{month_to_date_kwh:.1f} kWh" if month_to_date_kwh is not None and pd.notna(month_to_date_kwh) else "—",
+    help=f"Sigen meter actuals from {month_start} through {today}.",
 )
 if not history.empty:
     st.caption(f"Latest forecast downloaded: {latest_stamp.strftime('%d %b %Y, %H:%M UTC')} · {len(latest)} intervals")
