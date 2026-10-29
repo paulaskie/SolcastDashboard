@@ -1823,7 +1823,7 @@ def _render_amber_and_battery_panels():
                 with input_cols[1]:
                     st.markdown(
                         f"**Maximum: {max_pct}%**",
-                        text_alignment="right",
+                        text_alignment="left",
                     )
                 st.markdown(
                     f"{scenario_max_sell_kwh_by_window[period_index]:.1f} kWh  ·  "
