@@ -366,7 +366,8 @@ def add_solar_curtailment_shapes(fig, prices, local_date):
     if feed_in.empty:
         return
 
-    negative_feed_in = feed_in[pd.to_numeric(feed_in["per_kwh"], errors="coerce") > 0]
+    plotted_feed_in = -pd.to_numeric(feed_in["per_kwh"], errors="coerce")
+    negative_feed_in = feed_in[plotted_feed_in < 0]
     if negative_feed_in.empty:
         return
 
@@ -382,14 +383,18 @@ def add_solar_curtailment_shapes(fig, prices, local_date):
         )
         for _, row in negative_feed_in.iterrows()
     ])
-    for index, (window_start, window_end) in enumerate(windows):
+    for window_start, window_end in windows:
         fig.add_shape(
             type="rect", xref="x", yref="paper",
-            x0=window_start, x1=window_end, y0=0, y1=1, layer="below",
-            fillcolor="rgba(255,0,0,0.18)", line=dict(width=0),
-            showlegend=index == 0,
-            name="Solar curtailment (negative feed in prices)",
+            x0=window_start, x1=window_end, y0=0, y1=1, layer="above",
+            fillcolor="rgba(255,0,0,0.22)", line=dict(width=0),
         )
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(symbol="square", size=12, color="rgba(255,0,0,0.5)"),
+        name="Solar curtailment (negative feed in prices)",
+        hoverinfo="skip",
+    ))
 
 def overlapping_time_segments(interval_start, interval_end, windows):
     """Return the portions of a forecast interval covered by scenario windows."""
