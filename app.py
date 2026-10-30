@@ -279,6 +279,118 @@ def merge_time_windows(windows):
             merged.append((start, end))
     return merged
 
+def prepare_amber_intraday(prices, local_date, channel_types=None):
+    """Resolve Amber source intervals into the same five-minute buckets as the price chart."""
+    if prices.empty:
+        return prices.copy()
+
+    intraday = prices[prices["start_time_local"].dt.date.astype(str) == str(local_date)].copy()
+    if channel_types is not None:
+        intraday = intraday[intraday["channel_type"].isin(channel_types)].copy()
+    intraday = intraday[
+        intraday["per_kwh"].notna()
+        & intraday["price_type"].str.lower().isin(
+            ("actualinterval", "currentinterval", "forecastinterval")
+        )
+    ].copy()
+    if intraday.empty:
+        return intraday
+
+    intraday["_start_utc"] = pd.to_datetime(intraday["start_time_utc"], utc=True)
+    intraday["_end_utc"] = pd.to_datetime(intraday["end_time_utc"], utc=True)
+    actual_like = intraday[
+        intraday["price_type"].str.lower().isin(("actualinterval", "currentinterval"))
+    ].copy()
+    actual_like["_priority"] = actual_like["price_type"].str.lower().map(
+        {"actualinterval": 0, "currentinterval": 1}
+    )
+    actual_like["_source_duration_minutes"] = (
+        (actual_like["_end_utc"] - actual_like["_start_utc"]).dt.total_seconds() / 60
+    ).round().astype(int)
+    actual_like = (actual_like.sort_values(
+        ["_priority", "_source_duration_minutes", "fetched_at_utc"],
+        ascending=[True, True, False],
+    ).drop_duplicates(["channel_type", "start_time_utc"], keep="first"))
+    forecast = intraday[intraday["price_type"].str.lower() == "forecastinterval"].copy()
+    forecast["_source_duration_minutes"] = (
+        (forecast["_end_utc"] - forecast["_start_utc"]).dt.total_seconds() / 60
+    ).round().astype(int)
+    if pd.Timestamp(local_date).date() < pd.Timestamp.now(tz=TZ_NAME).date():
+        forecast = forecast.iloc[0:0].copy()
+    forecast = (forecast.sort_values(
+        ["fetched_at_utc", "_source_duration_minutes"], ascending=[False, True],
+    ).drop_duplicates(["channel_type", "start_time_utc", "end_time_utc"], keep="first"))
+    intervals = pd.concat([actual_like, forecast], ignore_index=True, sort=False)
+
+    bucket_rows = []
+    for _, source_row in intervals.iterrows():
+        bucket_start = source_row["_start_utc"].floor("5min")
+        while bucket_start < source_row["_end_utc"]:
+            bucket = source_row.copy()
+            bucket["_bucket_start_utc"] = bucket_start
+            bucket_rows.append(bucket)
+            bucket_start += pd.Timedelta(minutes=5)
+    intraday = pd.DataFrame(bucket_rows) if bucket_rows else intervals.iloc[0:0].copy()
+    if intraday.empty:
+        return intraday
+
+    latest_observed_bucket = (
+        actual_like.assign(
+            _bucket_start_utc=actual_like["_start_utc"].dt.floor("5min"),
+        )
+        .groupby("channel_type")["_bucket_start_utc"]
+        .max()
+        .to_dict()
+    )
+    if latest_observed_bucket:
+        observed_cutoff = intraday["channel_type"].map(latest_observed_bucket)
+        stale_forecast = (
+            intraday["price_type"].str.lower().eq("forecastinterval")
+            & observed_cutoff.notna()
+            & (intraday["_bucket_start_utc"] <= observed_cutoff)
+        )
+        intraday = intraday[~stale_forecast].copy()
+    intraday["_priority"] = intraday["price_type"].str.lower().map(
+        {"actualinterval": 0, "currentinterval": 1, "forecastinterval": 2}
+    )
+    intraday = (intraday.sort_values(
+        ["_priority", "_source_duration_minutes", "fetched_at_utc"],
+        ascending=[True, True, False],
+    ).drop_duplicates(["channel_type", "_bucket_start_utc"], keep="first"))
+    intraday["start_time_local"] = intraday["_bucket_start_utc"].dt.tz_convert(TZ_NAME)
+    return intraday.sort_values("start_time_local")
+
+def add_solar_curtailment_shapes(fig, prices, local_date):
+    """Shade intervals where feed-in prices plot below zero on Amber's price chart."""
+    feed_in = prepare_amber_intraday(prices, local_date, ["feedIn"])
+    if feed_in.empty:
+        return
+
+    negative_feed_in = feed_in[pd.to_numeric(feed_in["per_kwh"], errors="coerce") > 0]
+    if negative_feed_in.empty:
+        return
+
+    day_start = pd.Timestamp(local_date).tz_localize(TZ_NAME)
+    day_end = day_start + pd.DateOffset(days=1)
+    windows = merge_time_windows([
+        (
+            max(row["_bucket_start_utc"].tz_convert(TZ_NAME), day_start),
+            min(
+                row["_bucket_start_utc"].tz_convert(TZ_NAME) + pd.Timedelta(minutes=5),
+                day_end,
+            ),
+        )
+        for _, row in negative_feed_in.iterrows()
+    ])
+    for index, (window_start, window_end) in enumerate(windows):
+        fig.add_shape(
+            type="rect", xref="x", yref="paper",
+            x0=window_start, x1=window_end, y0=0, y1=1, layer="below",
+            fillcolor="rgba(255,0,0,0.18)", line=dict(width=0),
+            showlegend=index == 0,
+            name="Solar curtailment (negative feed in prices)",
+        )
+
 def overlapping_time_segments(interval_start, interval_end, windows):
     """Return the portions of a forecast interval covered by scenario windows."""
     return [
@@ -1307,80 +1419,9 @@ def _render_amber_and_battery_panels():
                 default=default_channels or available_channels,
                 key="amber_price_channels",
             )
-        amber_intraday = amber_prices[amber_prices["local_date"] == amber_chosen_date.isoformat()].copy()
-        amber_intraday = amber_intraday[
-            amber_intraday["channel_type"].isin(selected_channels)
-            & amber_intraday["per_kwh"].notna()
-            & amber_intraday["price_type"].str.lower().isin(
-                ("actualinterval", "currentinterval", "forecastinterval")
-            )
-        ].copy()
-        amber_intraday["_start_utc"] = pd.to_datetime(amber_intraday["start_time_utc"], utc=True)
-        amber_intraday["_end_utc"] = pd.to_datetime(amber_intraday["end_time_utc"], utc=True)
-        actual_like = amber_intraday[
-            amber_intraday["price_type"].str.lower().isin(("actualinterval", "currentinterval"))
-        ].copy()
-        actual_like["_priority"] = actual_like["price_type"].str.lower().map(
-            {"actualinterval": 0, "currentinterval": 1}
+        amber_intraday = prepare_amber_intraday(
+            amber_prices, amber_chosen_date.isoformat(), selected_channels,
         )
-        actual_like["_source_duration_minutes"] = (
-            (actual_like["_end_utc"] - actual_like["_start_utc"]).dt.total_seconds() / 60
-        ).round().astype(int)
-        actual_like = (actual_like.sort_values(
-            ["_priority", "_source_duration_minutes", "fetched_at_utc"],
-            ascending=[True, True, False],
-        ).drop_duplicates(["channel_type", "start_time_utc"], keep="first"))
-        forecast = amber_intraday[amber_intraday["price_type"].str.lower() == "forecastinterval"].copy()
-        forecast["_source_duration_minutes"] = (
-            (forecast["_end_utc"] - forecast["_start_utc"]).dt.total_seconds() / 60
-        ).round().astype(int)
-        if amber_chosen_date < pd.Timestamp.now(tz=TZ_NAME).date():
-            # Historical days should show finalized prices, never stale forecasts.
-            forecast = forecast.iloc[0:0].copy()
-        forecast = (forecast.sort_values(
-            ["fetched_at_utc", "_source_duration_minutes"], ascending=[False, True],
-        ).drop_duplicates(["channel_type", "start_time_utc", "end_time_utc"], keep="first"))
-        intervals = pd.concat([actual_like, forecast], ignore_index=True, sort=False)
-        # Expand any longer Amber source interval to 5-minute buckets, then retain
-        # one row per bucket: actual, current, then shortest/latest forecast.
-        bucket_rows = []
-        for _, source_row in intervals.iterrows():
-            bucket_start = source_row["_start_utc"].floor("5min")
-            while bucket_start < source_row["_end_utc"]:
-                bucket = source_row.copy()
-                bucket["_bucket_start_utc"] = bucket_start
-                bucket_rows.append(bucket)
-                bucket_start += pd.Timedelta(minutes=5)
-        amber_intraday = pd.DataFrame(bucket_rows) if bucket_rows else intervals.iloc[0:0].copy()
-        if not amber_intraday.empty:
-            # A forecast can come from an earlier snapshot and extend back to midnight.
-            # Once actual/current prices cover those buckets, only show the dotted
-            # forecast after the latest observed bucket for that channel.
-            latest_observed_bucket = (
-                actual_like.assign(
-                    _bucket_start_utc=actual_like["_start_utc"].dt.floor("5min"),
-                )
-                .groupby("channel_type")["_bucket_start_utc"]
-                .max()
-                .to_dict()
-            )
-            if latest_observed_bucket:
-                observed_cutoff = amber_intraday["channel_type"].map(latest_observed_bucket)
-                stale_forecast = (
-                    amber_intraday["price_type"].str.lower().eq("forecastinterval")
-                    & observed_cutoff.notna()
-                    & (amber_intraday["_bucket_start_utc"] <= observed_cutoff)
-                )
-                amber_intraday = amber_intraday[~stale_forecast].copy()
-            amber_intraday["_priority"] = amber_intraday["price_type"].str.lower().map(
-                {"actualinterval": 0, "currentinterval": 1, "forecastinterval": 2}
-            )
-            amber_intraday = (amber_intraday.sort_values(
-                ["_priority", "_source_duration_minutes", "fetched_at_utc"],
-                ascending=[True, True, False],
-            ).drop_duplicates(["channel_type", "_bucket_start_utc"], keep="first"))
-            amber_intraday["start_time_local"] = amber_intraday["_bucket_start_utc"].dt.tz_convert(TZ_NAME)
-            amber_intraday = amber_intraday.sort_values("start_time_local")
         chart_prices = amber_intraday["per_kwh"].astype(float).where(
             amber_intraday["channel_type"] != "feedIn", -amber_intraday["per_kwh"].astype(float)
         ).dropna()
@@ -2710,6 +2751,7 @@ def _render_solcast_power_by_time():
     fig2.update_xaxes(
         range=[solcast_chart_day_start, solcast_chart_day_end], fixedrange=True,
     )
+    add_solar_curtailment_shapes(fig2, amber_prices, chosen_date)
     place_legend_below_chart(fig2)
     st.plotly_chart(fig2, width="stretch")
 
@@ -3023,6 +3065,8 @@ def _render_openmeteo_power_by_time():
         fig3.update_xaxes(range=[chart_day_start, chart_day_end], fixedrange=True)
     fig3.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
                        margin=dict(l=10, r=10, t=20, b=10), hovermode="closest")
+    if openmeteo_chosen_date is not None:
+        add_solar_curtailment_shapes(fig3, amber_prices, openmeteo_chosen_date)
     place_legend_below_chart(fig3)
     st.plotly_chart(fig3, width="stretch")
 
