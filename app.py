@@ -3108,6 +3108,60 @@ def _render_openmeteo_power_by_time():
             st.dataframe(openmeteo_lead_scores, width="stretch", hide_index=True)
             st.caption("Each saved 15-minute forecast interval is scored at its original issue time, grouped by time until the interval starts.")
 
+    st.subheader("Open-Meteo winter daily energy estimate")
+    st.caption(
+        "Daily satellite archive estimates for June-August 2026. Only days with "
+        "complete archive coverage are included."
+    )
+    winter_archive = (
+        openmeteo_hourly[
+            openmeteo_hourly["local_date"].between("2026-06-01", "2026-08-31")
+        ].copy()
+        if not openmeteo_hourly.empty else pd.DataFrame()
+    )
+    winter_daily_rows = []
+    for local_date, day_rows in winter_archive.groupby("local_date"):
+        day_rows = day_rows.sort_values("time_local")
+        interval_hours = (
+            day_rows["time_local"].diff().dt.total_seconds().median() / 3600
+        )
+        if pd.isna(interval_hours) or interval_hours <= 0:
+            continue
+        interval_ends = (
+            pd.DatetimeIndex(day_rows["time_local"])
+            + pd.to_timedelta(interval_hours, unit="h")
+        )
+        if not intervals_cover_full_local_day(
+            interval_ends, [interval_hours] * len(day_rows), local_date,
+        ):
+            continue
+        winter_daily_rows.append({
+            "local_date": local_date,
+            "estimate_kwh": (
+                pd.to_numeric(day_rows["openmeteo_power_kw"], errors="coerce").sum()
+                * interval_hours
+            ),
+        })
+    winter_daily_estimates = pd.DataFrame(winter_daily_rows)
+    if winter_daily_estimates.empty:
+        st.info("No complete Open-Meteo satellite archive days are available for winter 2026.")
+    else:
+        winter_fig = go.Figure(go.Bar(
+            x=pd.to_datetime(winter_daily_estimates["local_date"]),
+            y=winter_daily_estimates["estimate_kwh"],
+            name="Open-Meteo satellite estimate",
+            marker_color="#7b61a8",
+            hovertemplate="%{x|%d %b %Y}<br>Estimate: %{y:.2f} kWh<extra></extra>",
+        ))
+        winter_fig.update_layout(
+            xaxis_title="Date (Sydney)", yaxis_title="Estimated energy (kWh)",
+            margin=dict(l=10, r=10, t=20, b=10),
+        )
+        winter_fig.update_xaxes(
+            tickformat="%d %b", dtick=7 * 24 * 60 * 60 * 1000,
+        )
+        st.plotly_chart(winter_fig, width="stretch")
+
 
 _render_openmeteo_power_by_time()
 
