@@ -2760,17 +2760,11 @@ def _render_solcast_power_by_time():
     place_legend_below_chart(fig2)
     st.plotly_chart(fig2, width="stretch")
 
-    st.markdown("**Solcast accuracy against Sigen actuals**")
+    st.markdown("**Solcast forecast accuracy against Sigen actuals**")
     solcast_accuracy_rows = []
     score = power_accuracy_metrics(
-        "Solcast forecast", solcast_chart_forecast, "period_end_utc", "pv_estimate",
-        meter_power_intraday, 0.5,
-    )
-    if score:
-        solcast_accuracy_rows.append(score)
-    score = power_accuracy_metrics(
-        "Solcast estimated actual", actual_intraday, "period_end_utc", "pv_estimate",
-        meter_power_intraday, 0.5,
+        "Solcast forecast", solcast_comparison_weather, "time_local",
+        "solcast_forecast_power_kw", meter_power_intraday, 5 / 60,
     )
     if score:
         solcast_accuracy_rows.append(score)
@@ -2778,7 +2772,7 @@ def _render_solcast_power_by_time():
         st.dataframe(pd.DataFrame(solcast_accuracy_rows), width="stretch", hide_index=True)
         st.caption("MAE and RMSE show typical point error; positive bias and energy error mean over-prediction. Scores use matched timestamps only.")
     else:
-        st.caption("Accuracy scores appear when Sigen actuals overlap the selected Solcast date.")
+        st.caption("Forecast accuracy scores appear when Solcast forecast power and Sigen actuals overlap the selected date.")
 
     solcast_lead_rows = history[history["local_date"] == chosen_date]
     solcast_lead_scores = forecast_lead_time_scores(
