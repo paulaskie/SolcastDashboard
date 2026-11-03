@@ -2429,6 +2429,10 @@ daily["daylight_tooltip"] = daily["daylight_hours_comparison"].map(
 )
 daily_tooltip_data = daily[["Forecast_tooltip", "Estimated_actual_tooltip", "Meter_actual_tooltip",
                             "Sigen_nonzero_tooltip", "daylight_tooltip"]].to_numpy()
+daily_window_start = (
+    pd.Timestamp(today).replace(day=1) - pd.DateOffset(months=1)
+).normalize()
+daily_window_end = pd.Timestamp(today) + pd.Timedelta(days=7)
 fig = go.Figure()
 fig.add_trace(go.Bar(
     x=daily["local_date"], y=daily["Actual_energy_kWh"],
@@ -2463,6 +2467,13 @@ fig.add_trace(go.Scatter(
 fig.update_layout(barmode="stack")
 fig.update_layout(xaxis_title="Date (Sydney)", yaxis_title="Energy (kWh)",
                   margin=dict(l=10, r=10, t=20, b=10), xaxis_tickangle=-35)
+fig.update_xaxes(
+    type="date",
+    range=[
+        (daily_window_start - pd.Timedelta(hours=12)).isoformat(),
+        (daily_window_end + pd.Timedelta(hours=12)).isoformat(),
+    ],
+)
 place_legend_below_chart(fig)
 st.plotly_chart(fig, width="stretch")
 
