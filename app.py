@@ -3111,7 +3111,7 @@ def _render_openmeteo_power_by_time():
     st.subheader("Open-Meteo winter daily energy estimate")
     st.caption(
         "Daily satellite archive estimates for June-August 2026. Partial days are "
-        "included; the line shows the share of daylight hours covered by archive data."
+        "included. Hover over a bar to see its daylight data completeness."
     )
     winter_archive = (
         openmeteo_hourly[
@@ -3166,7 +3166,27 @@ def _render_openmeteo_power_by_time():
                 ),
                 "daylight_completeness_pct": completeness_pct,
             })
-    winter_daily_estimates = pd.DataFrame(winter_daily_rows)
+    winter_daily_estimates = pd.DataFrame(
+        winter_daily_rows,
+        columns=["local_date", "estimate_kwh", "daylight_completeness_pct"],
+    )
+    winter_month_cols = st.columns(3)
+    for column, (month_name, month_prefix) in zip(
+        winter_month_cols,
+        (("June", "2026-06"), ("July", "2026-07"), ("August", "2026-08")),
+    ):
+        month_total = pd.to_numeric(
+            winter_daily_estimates.loc[
+                winter_daily_estimates["local_date"].str.startswith(month_prefix),
+                "estimate_kwh",
+            ],
+            errors="coerce",
+        ).sum(min_count=1)
+        column.metric(
+            f"{month_name} estimated energy",
+            f"{month_total:.1f} kWh" if pd.notna(month_total) else "—",
+            help="Sum of the available daily satellite estimates; partial days are included.",
+        )
     if winter_daily_estimates.empty:
         st.info("No Open-Meteo satellite archive data is available for winter 2026.")
     else:
@@ -3182,21 +3202,8 @@ def _render_openmeteo_power_by_time():
                 "<br>Daylight coverage: %{customdata[0]:.1f}%<extra></extra>"
             ),
         ))
-        winter_fig.add_trace(go.Scatter(
-            x=winter_dates,
-            y=winter_daily_estimates["daylight_completeness_pct"],
-            name="Daylight data completeness (%)",
-            yaxis="y2",
-            mode="lines+markers",
-            line=dict(color="#E76F51", width=2),
-            hovertemplate="%{x|%d %b %Y}<br>Daylight coverage: %{y:.1f}%<extra></extra>",
-        ))
         winter_fig.update_layout(
             xaxis_title="Date (Sydney)", yaxis_title="Available estimate (kWh)",
-            yaxis2=dict(
-                title="Daylight coverage (%)", overlaying="y", side="right",
-                range=[0, 100], ticksuffix="%",
-            ),
             margin=dict(l=10, r=10, t=20, b=10),
         )
         winter_fig.update_xaxes(
