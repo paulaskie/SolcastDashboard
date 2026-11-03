@@ -3110,8 +3110,8 @@ def _render_openmeteo_power_by_time():
 
     st.subheader("Open-Meteo winter daily energy estimate")
     st.caption(
-        "Daily satellite archive estimates for June-August 2026. Only days with "
-        "complete archive coverage are included."
+        "Daily satellite archive estimates for June-August 2026. Partial days are "
+        "included; the line shows the share of daylight hours covered by archive data."
     )
     winter_archive = (
         openmeteo_hourly[
@@ -3120,41 +3120,83 @@ def _render_openmeteo_power_by_time():
         if not openmeteo_hourly.empty else pd.DataFrame()
     )
     winter_daily_rows = []
-    for local_date, day_rows in winter_archive.groupby("local_date"):
-        day_rows = day_rows.sort_values("time_local")
-        interval_hours = (
-            day_rows["time_local"].diff().dt.total_seconds().median() / 3600
-        )
-        if pd.isna(interval_hours) or interval_hours <= 0:
-            continue
-        interval_ends = (
-            pd.DatetimeIndex(day_rows["time_local"])
-            + pd.to_timedelta(interval_hours, unit="h")
-        )
-        if not intervals_cover_full_local_day(
-            interval_ends, [interval_hours] * len(day_rows), local_date,
-        ):
-            continue
-        winter_daily_rows.append({
-            "local_date": local_date,
-            "estimate_kwh": (
-                pd.to_numeric(day_rows["openmeteo_power_kw"], errors="coerce").sum()
-                * interval_hours
-            ),
-        })
+    winter_sample_spacing = (
+        winter_archive["time_local"].drop_duplicates().sort_values()
+        .diff().dt.total_seconds().median() / 3600
+        if not winter_archive.empty else float("nan")
+    )
+    daily_weather = (
+        openmeteo_daily.set_index("local_date").to_dict("index")
+        if not openmeteo_daily.empty else {}
+    )
+    if pd.notna(winter_sample_spacing) and winter_sample_spacing > 0:
+        for local_date, day_rows in winter_archive.groupby("local_date"):
+            day_rows = day_rows.sort_values("time_local")
+            day_start = pd.Timestamp(local_date).tz_localize(TZ_NAME)
+            day_end = day_start + pd.DateOffset(days=1)
+            sunrise = daily_weather.get(local_date, {}).get("sunrise_local")
+            sunset = daily_weather.get(local_date, {}).get("sunset_local")
+            daylight_seconds = (
+                (sunset - sunrise).total_seconds()
+                if pd.notna(sunrise) and pd.notna(sunset) and sunset > sunrise
+                else None
+            )
+            covered_daylight_seconds = 0.0
+            for sample_time in day_rows["time_local"]:
+                interval_start = max(sample_time, day_start)
+                interval_end = min(
+                    sample_time + pd.Timedelta(hours=winter_sample_spacing), day_end,
+                )
+                if daylight_seconds is not None:
+                    overlap_start = max(interval_start, sunrise)
+                    overlap_end = min(interval_end, sunset)
+                    if overlap_end > overlap_start:
+                        covered_daylight_seconds += (
+                            overlap_end - overlap_start
+                        ).total_seconds()
+            completeness_pct = (
+                min(100.0, covered_daylight_seconds / daylight_seconds * 100)
+                if daylight_seconds else None
+            )
+            winter_daily_rows.append({
+                "local_date": local_date,
+                "estimate_kwh": (
+                    pd.to_numeric(day_rows["openmeteo_power_kw"], errors="coerce").sum()
+                    * winter_sample_spacing
+                ),
+                "daylight_completeness_pct": completeness_pct,
+            })
     winter_daily_estimates = pd.DataFrame(winter_daily_rows)
     if winter_daily_estimates.empty:
-        st.info("No complete Open-Meteo satellite archive days are available for winter 2026.")
+        st.info("No Open-Meteo satellite archive data is available for winter 2026.")
     else:
+        winter_dates = pd.to_datetime(winter_daily_estimates["local_date"])
         winter_fig = go.Figure(go.Bar(
-            x=pd.to_datetime(winter_daily_estimates["local_date"]),
+            x=winter_dates,
             y=winter_daily_estimates["estimate_kwh"],
             name="Open-Meteo satellite estimate",
             marker_color="#7b61a8",
-            hovertemplate="%{x|%d %b %Y}<br>Estimate: %{y:.2f} kWh<extra></extra>",
+            customdata=winter_daily_estimates[["daylight_completeness_pct"]],
+            hovertemplate=(
+                "%{x|%d %b %Y}<br>Available estimate: %{y:.2f} kWh"
+                "<br>Daylight coverage: %{customdata[0]:.1f}%<extra></extra>"
+            ),
+        ))
+        winter_fig.add_trace(go.Scatter(
+            x=winter_dates,
+            y=winter_daily_estimates["daylight_completeness_pct"],
+            name="Daylight data completeness (%)",
+            yaxis="y2",
+            mode="lines+markers",
+            line=dict(color="#E76F51", width=2),
+            hovertemplate="%{x|%d %b %Y}<br>Daylight coverage: %{y:.1f}%<extra></extra>",
         ))
         winter_fig.update_layout(
-            xaxis_title="Date (Sydney)", yaxis_title="Estimated energy (kWh)",
+            xaxis_title="Date (Sydney)", yaxis_title="Available estimate (kWh)",
+            yaxis2=dict(
+                title="Daylight coverage (%)", overlaying="y", side="right",
+                range=[0, 100], ticksuffix="%",
+            ),
             margin=dict(l=10, r=10, t=20, b=10),
         )
         winter_fig.update_xaxes(
