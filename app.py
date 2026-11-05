@@ -384,18 +384,17 @@ def solar_curtailment_windows(prices, local_date):
         for _, row in negative_feed_in.iterrows()
     ])
 
-def mask_solar_curtailment_periods(
-    frame, time_column, value_column, windows, period_hours_column=None,
-    period_duration=None,
+def solar_curtailment_period_mask(
+    frame, time_column, windows, period_hours_column=None, period_duration=None,
 ):
-    """Hide power values whose timestamp or measurement period overlaps curtailment."""
-    masked = frame.copy()
-    if masked.empty or not windows:
-        return masked
+    """Return a mask for timestamps or measurement periods overlapping curtailment."""
+    curtailed = pd.Series(False, index=frame.index)
+    if frame.empty or not windows:
+        return curtailed
 
-    times = pd.to_datetime(masked[time_column])
+    times = pd.to_datetime(frame[time_column])
     if period_hours_column is not None:
-        period_start = times - pd.to_timedelta(masked[period_hours_column], unit="h")
+        period_start = times - pd.to_timedelta(frame[period_hours_column], unit="h")
         period_end = times
     elif period_duration is not None:
         period_start = times - period_duration
@@ -404,14 +403,50 @@ def mask_solar_curtailment_periods(
         period_start = times
         period_end = times
 
-    curtailed = pd.Series(False, index=masked.index)
     for window_start, window_end in windows:
         if period_hours_column is not None or period_duration is not None:
             curtailed |= (period_start < window_end) & (period_end > window_start)
         else:
             curtailed |= (times >= window_start) & (times < window_end)
+    return curtailed
+
+def mask_solar_curtailment_periods(
+    frame, time_column, value_column, windows, period_hours_column=None,
+    period_duration=None,
+):
+    """Hide power values whose timestamp or measurement period overlaps curtailment."""
+    masked = frame.copy()
+    curtailed = solar_curtailment_period_mask(
+        masked, time_column, windows, period_hours_column, period_duration,
+    )
     masked.loc[curtailed, value_column] = float("nan")
     return masked
+
+def add_solar_curtailment_markers(
+    fig, frame, time_column, value_column, windows, series_name, color,
+    period_hours_column=None, period_duration=None,
+):
+    """Mark each plotted value omitted because its period overlaps curtailment."""
+    if frame.empty or not windows:
+        return
+    curtailed = solar_curtailment_period_mask(
+        frame, time_column, windows, period_hours_column, period_duration,
+    )
+    excluded = frame.loc[curtailed & frame[value_column].notna()]
+    if excluded.empty:
+        return
+    fig.add_trace(go.Scatter(
+        x=excluded[time_column],
+        y=excluded[value_column],
+        mode="markers",
+        name=f"Curtailment-excluded: {series_name}",
+        marker=dict(symbol="x", size=9, color=color, line=dict(width=2)),
+        hovertemplate=(
+            "%{x|%H:%M}<br>"
+            f"{series_name}: %{{y:.2f}} kW"
+            "<br>Excluded during solar curtailment<extra></extra>"
+        ),
+    ))
 
 def add_solar_curtailment_shapes(fig, prices, local_date):
     """Shade intervals where feed-in prices plot below zero on Amber's price chart."""
@@ -2792,6 +2827,11 @@ def _render_solcast_power_by_time():
                 "<br>Source: %{customdata[1]}<extra></extra>"
             ),
         ))
+    add_solar_curtailment_markers(
+        fig2, solcast_forecast_intraday, "period_end_local", "pv_estimate",
+        solcast_curtailment_windows, "Solcast forecast power", "#636EFA",
+        period_hours_column="period_hours",
+    )
     if not solcast_chart_actual.empty:
         fig2.add_trace(go.Scatter(
             x=solcast_chart_actual["period_end_local"], y=solcast_chart_actual["pv_estimate"],
@@ -2800,6 +2840,11 @@ def _render_solcast_power_by_time():
             customdata=solcast_chart_actual[["forecast_kwh_tooltip", "actual_kwh_tooltip"]].to_numpy(),
             hovertemplate="%{x|%H:%M}<br>Estimated actual: %{y:.2f} kW<br>Forecast energy: %{customdata[0]}<br>Estimated actual energy: %{customdata[1]}<extra></extra>"
         ))
+    add_solar_curtailment_markers(
+        fig2, actual_intraday, "period_end_local", "pv_estimate",
+        solcast_curtailment_windows, "Solcast estimated actual power", "#f2a541",
+        period_hours_column="period_hours",
+    )
     if not solcast_chart_meter.empty:
         fig2.add_trace(go.Scatter(
             x=solcast_chart_meter["period_end_local"],
@@ -2808,15 +2853,20 @@ def _render_solcast_power_by_time():
             line=dict(width=2, color="#83C9FF"),
             hovertemplate="%{x|%H:%M}<br>Meter actual power: %{y:.3f} kW<extra></extra>"
         ))
+    add_solar_curtailment_markers(
+        fig2, meter_power_intraday, "period_end_local", "Solar Production (kW)",
+        solcast_curtailment_windows, "Sigen meter actual power", "#83C9FF",
+        period_duration=pd.Timedelta(minutes=5),
+    )
     meter_power_30min_solcast = resample_meter_power_to_30min(meter_power_intraday, chosen_date)
     if not meter_power_30min_solcast.empty:
-        meter_power_30min_solcast = mask_solar_curtailment_periods(
+        plotted_meter_power_30min_solcast = mask_solar_curtailment_periods(
             meter_power_30min_solcast, "time_local", "Solar Production (kW)",
             solcast_curtailment_windows, period_duration=pd.Timedelta(minutes=30),
         )
         fig2.add_trace(go.Scatter(
-            x=meter_power_30min_solcast["time_local"],
-            y=meter_power_30min_solcast["Solar Production (kW)"],
+            x=plotted_meter_power_30min_solcast["time_local"],
+            y=plotted_meter_power_30min_solcast["Solar Production (kW)"],
             mode="lines", connectgaps=False,
             name="Sigen meter actual power (30-minute mean)",
             line=dict(width=2, color="#83C9FF", dash="dash"),
@@ -2825,6 +2875,11 @@ def _render_solcast_power_by_time():
                 "%{y:.3f} kW<extra></extra>"
             ),
         ))
+        add_solar_curtailment_markers(
+            fig2, meter_power_30min_solcast, "time_local", "Solar Production (kW)",
+            solcast_curtailment_windows, "Sigen meter actual power (30-minute mean)",
+            "#83C9FF", period_duration=pd.Timedelta(minutes=30),
+        )
     if solcast_chart_forecast.empty and actual_intraday.empty and meter_power_intraday.empty:
         st.info("No forecast or estimated actual intervals are saved for this date.")
     fig2.update_layout(xaxis_title="Time (Sydney)", yaxis_title="Power (kW)",
@@ -3132,6 +3187,11 @@ def _render_openmeteo_power_by_time():
             line=dict(width=2, color="#83C9FF"),
             hovertemplate="%{x|%H:%M}<br>Sigen meter actual: %{y:.3f} kW<extra></extra>"
         ))
+    add_solar_curtailment_markers(
+        fig3, meter_openmeteo_intraday, "period_end_local", "Solar Production (kW)",
+        openmeteo_curtailment_windows, "Sigen meter actual power", "#83C9FF",
+        period_duration=pd.Timedelta(minutes=5),
+    )
     if not plotted_sigen_30min_actuals.empty:
         fig3.add_trace(go.Scatter(
             x=plotted_sigen_30min_actuals["time_local"],
@@ -3144,6 +3204,11 @@ def _render_openmeteo_power_by_time():
                 "%{y:.3f} kW<extra></extra>"
             ),
         ))
+    add_solar_curtailment_markers(
+        fig3, sigen_30min_actuals, "time_local", "Solar Production (kW)",
+        openmeteo_curtailment_windows, "Sigen meter actual power (30-minute mean)",
+        "#83C9FF", period_duration=pd.Timedelta(minutes=30),
+    )
     if not plotted_openmeteo_archive.empty:
         # Preserve the satellite archive's native time steps and short-term variation.
         plotted_weather = plotted_openmeteo_archive
@@ -3155,14 +3220,18 @@ def _render_openmeteo_power_by_time():
             hovertemplate="%{x|%H:%M}<br>Open-Meteo estimate: %{y:.2f} kW"
                           "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
         ))
+    add_solar_curtailment_markers(
+        fig3, openmeteo_intraday, "time_local", "openmeteo_power_kw",
+        openmeteo_curtailment_windows, "Open-Meteo satellite estimate", "#7b61a8",
+    )
+    forecast_label = (
+        "historical forecast"
+        if openmeteo_forecast_intraday.empty
+        else "weather forecast"
+    )
     if not plotted_openmeteo_forecast.empty:
         # Keep the selected forecast visible even when Sigen actuals cover only part of today.
         plotted_forecast = plotted_openmeteo_forecast
-        forecast_label = (
-            "historical forecast"
-            if openmeteo_forecast_intraday.empty
-            else "weather forecast"
-        )
         fig3.add_trace(go.Scatter(
             x=plotted_forecast["time_local"], y=plotted_forecast["openmeteo_power_kw"],
             mode="lines", name=f"Open-Meteo {forecast_label} estimate (kW)",
@@ -3171,6 +3240,11 @@ def _render_openmeteo_power_by_time():
             hovertemplate=f"%{{x|%H:%M}}<br>Open-Meteo {forecast_label}: %{{y:.2f}} kW"
                           "<br>16:4 north/east weighted irradiance: %{customdata:.0f} W/m²<extra></extra>"
         ))
+    add_solar_curtailment_markers(
+        fig3, openmeteo_forecast_comparison, "time_local", "openmeteo_power_kw",
+        openmeteo_curtailment_windows, f"Open-Meteo {forecast_label} estimate",
+        "#7b61a8",
+    )
     if (meter_openmeteo_intraday.empty and openmeteo_intraday.empty
             and openmeteo_forecast_intraday.empty and openmeteo_historical_forecast_intraday.empty):
         st.info("No Sigen, Open-Meteo, or Solcast forecast data is saved for this date.")
