@@ -424,7 +424,7 @@ def mask_solar_curtailment_periods(
 
 def add_solar_curtailment_markers(
     fig, frame, time_column, value_column, windows, series_name, color,
-    period_hours_column=None, period_duration=None,
+    period_hours_column=None, period_duration=None, marker_symbol="x",
 ):
     """Mark each plotted value omitted because its period overlaps curtailment."""
     if frame.empty or not windows:
@@ -440,7 +440,7 @@ def add_solar_curtailment_markers(
         y=excluded[value_column],
         mode="markers",
         name=f"Curtailment-excluded: {series_name}",
-        marker=dict(symbol="x", size=9, color=color, line=dict(width=2)),
+        marker=dict(symbol=marker_symbol, size=9, color=color, line=dict(width=2)),
         hovertemplate=(
             "%{x|%H:%M}<br>"
             f"{series_name}: %{{y:.2f}} kW"
@@ -2879,6 +2879,7 @@ def _render_solcast_power_by_time():
             fig2, meter_power_30min_solcast, "time_local", "Solar Production (kW)",
             solcast_curtailment_windows, "Sigen meter actual power (30-minute mean)",
             "#83C9FF", period_duration=pd.Timedelta(minutes=30),
+            marker_symbol="triangle-up",
         )
     if solcast_chart_forecast.empty and actual_intraday.empty and meter_power_intraday.empty:
         st.info("No forecast or estimated actual intervals are saved for this date.")
@@ -3208,6 +3209,7 @@ def _render_openmeteo_power_by_time():
         fig3, sigen_30min_actuals, "time_local", "Solar Production (kW)",
         openmeteo_curtailment_windows, "Sigen meter actual power (30-minute mean)",
         "#83C9FF", period_duration=pd.Timedelta(minutes=30),
+        marker_symbol="triangle-up",
     )
     if not plotted_openmeteo_archive.empty:
         # Preserve the satellite archive's native time steps and short-term variation.
